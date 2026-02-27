@@ -25,35 +25,39 @@ class ResBlock3x3(nn.Module):
 
 
 class Resnet(nn.Module):
-    def __init__(self, n):
+    def __init__(self, num_layers, num_classes, feature_base=16):
         super().__init__()
-        self.model = self._build_model(n)
+        num_stage_layers = int((num_layers-2)/6)
+        
+        self.conv1 = nn.Conv2d(3, feature_base, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(feature_base)
+        self.relu = nn.ReLU()
+        self.stage1 = nn.Sequential(*[ResBlock3x3(feature_base, feature_base) for _ in range(num_stage_layers)])
+        self.conv2 = ResBlock3x3(feature_base, feature_base*2, stride=2)
+        self.stage2 = nn.Sequential(*[ResBlock3x3(feature_base*2, feature_base*2) for _ in range(num_stage_layers-1)])
+        self.conv3 = ResBlock3x3(feature_base*2, feature_base*4, stride=2)
+        self.stage3 = nn.Sequential(*[ResBlock3x3(feature_base*4, feature_base*4) for _ in range(num_stage_layers-1)])
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(feature_base*4, num_classes)
+
         self._initialize_weights()
 
-    def _build_model(self, n):
-        n = int((n-2)/6)
-        print(n)
-        base = 16
-        model = nn.Sequential(
-            nn.Conv2d(3, base, 3, padding=1, bias=False),
-            nn.BatchNorm2d(base),
-            nn.ReLU(),
-            *[ResBlock3x3(base, base) for _ in range(n)],
-            ResBlock3x3(base, base*2, stride=2),
-            *[ResBlock3x3(base*2, base*2) for _ in range(n-1)],
-            ResBlock3x3(base*2, base*4, stride=2),
-            *[ResBlock3x3(base*4, base*4) for _ in range(n-1)],
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(base*4, 10)
-        )
-        return model
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.stage1(x)
+        x = self.conv2(x)
+        x = self.stage2(x)
+        x = self.conv3(x)
+        x = self.stage3(x)
+        x = self.avgpool(x)
+        x = self.flatten(x)
+        logits = self.fc(x)
+        return logits
 
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight)
-
-    def forward(self, x):
-        logits = self.model(x)
-        return logits
