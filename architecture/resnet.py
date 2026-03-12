@@ -24,7 +24,7 @@ class ResBlock3x3(nn.Module):
         return self.relu(x + fx)
 
 
-class Resnet(nn.Module):
+class ResNet(nn.Module):
     def __init__(self, num_layers, num_classes, feature_base=16):
         super().__init__()
         num_stage_layers = int((num_layers-2)/6)

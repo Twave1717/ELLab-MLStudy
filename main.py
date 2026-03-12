@@ -92,7 +92,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=0.1)
     parser.add_argument('--weight_decay', type=float, default=0.0001)
-    parser.add_argument('--epochs', type=int, default=150)
+    parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--model', type=str, default="resnet-20")
     parser.add_argument('--dataset_name', type=str, default="CIFAR10")
     parser.add_argument('--save_path', type=str, default="checkpoint")
@@ -104,7 +104,9 @@ def main():
     
     model_name, n = args.model.split('-')
     if model_name == 'resnet':
-        model = architecture.Resnet(int(n), num_classes).to(device)
+        model = architecture.ResNet(int(n), num_classes).to(device)
+    elif model_name == 'preactresnet':
+        model = architecture.PreActResNet(int(n), num_classes).to(device)
     loss_fn = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[args.epochs // 2, args.epochs * 3 // 4], gamma=0.1)
