@@ -14,11 +14,11 @@ class ZeroPadShortcut(nn.Module):
 
 
 class PreActResBlock3x3(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, initial_block=False):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
         super().__init__()
         self.plain_sequence = nn.Sequential(
-            nn.BatchNorm2d(in_channels) if not initial_block else nn.Identity(),
-            nn.ReLU() if not initial_block else nn.Identity(),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(),
             nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(),
@@ -42,9 +42,7 @@ class PreActResNet(nn.Module):
         
         self.conv1 = nn.Conv2d(3, feature_base, 3, padding=1)
         self.stage1 = nn.Sequential(
-            nn.BatchNorm2d(feature_base),
-            nn.ReLU(),
-            PreActResBlock3x3(feature_base, feature_base, initial_block=True),
+            PreActResBlock3x3(feature_base, feature_base),
             *[PreActResBlock3x3(feature_base, feature_base) for _ in range(num_stage_layers-1)]
         )
         self.stage2 = nn.Sequential(

@@ -13,9 +13,8 @@
 
 # Quick Start
 ```bash
-conda env create -f environment.yml
-conda env activate MLStudy
-python main.py --model resnet-20
+uv sync
+uv run python main.py --model resnet-20
 
 chmod +x ./tensorboard.sh
 ./tensorboard.sh
@@ -23,5 +22,5 @@ chmod +x ./tensorboard.sh
 
 # Models
 ## Resnet
-- model name: resnet-n
+- model name: resnet-n / preactresnet-n
 - n: layer size (n = 6a + 2 형태의 값이어야 함)
