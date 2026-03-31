@@ -1,0 +1,22 @@
+[project]
+name = "ml-study"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "tensorboard>=2.20.0",
+    "torch==2.7.1+cu118",
+    "torchaudio==2.7.1+cu118",
+    "torchvision==0.22.1+cu118",
+]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+torchaudio = { index = "pytorch" }
