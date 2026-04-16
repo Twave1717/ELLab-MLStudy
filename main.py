@@ -89,7 +89,7 @@ def test(epoch, dataloader, device, model, loss_fn, tensorboard_writer):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=0.1)
     parser.add_argument('--weight_decay', type=float, default=0.0001)
     parser.add_argument('--epochs', type=int, default=200)
@@ -103,14 +103,21 @@ def main():
     print(f"Using {device} device")
     
     model_name, n = args.model.split('-')
+    lr = args.lr
     if model_name == 'resnet':
         model = architecture.ResNet(int(n), num_classes).to(device)
     elif model_name == 'preactresnet':
         model = architecture.PreActResNet(int(n), num_classes).to(device)
     elif model_name == "densenet":
         model = architecture.DenseNet(int(n), num_classes).to(device)
+    elif model_name == "fractalnet":
+        model = architecture.FractalNet(int(n), num_classes).to(device)
+    elif model_name == "fractalnet_droppath":
+        model = architecture.FractalNetDropPath(int(n), num_classes).to(device)
+        lr = 0.02       # lr = 0.1 설정시 발산 
+
     loss_fn = nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[args.epochs // 2, args.epochs * 3 // 4], gamma=0.1)
     tensorboard_writer = SummaryWriter()
 
