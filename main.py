@@ -115,6 +115,8 @@ def main():
     elif model_name == "fractalnet_droppath":
         model = architecture.FractalNetDropPath(int(n), num_classes).to(device)
         lr = 0.02       # lr = 0.1 설정시 발산 
+    elif model_name == "vit_pretrained":
+        model = architecture.VisionTransformer(int(n), num_classes).to(device)
 
     loss_fn = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=args.weight_decay)
