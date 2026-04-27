@@ -46,7 +46,7 @@ def get_dataloader(batch_size, dataset_name):
     return train_dataloader, test_dataloader, num_classes
 
 
-def train(epochs, train_dataloader, test_dataloader, device, model, loss_fn, optimizer, scheduler, tensorboard_writer):
+def train(epochs, train_dataloader, test_dataloader, device, model, loss_fn, optimizer, scheduler, tensorboard_writer, grad_clip=None):
     global_step = -1
     for epoch in range(1, epochs+1):
         print(f"Epoch {epoch}\n-------------------------------")
@@ -57,6 +57,8 @@ def train(epochs, train_dataloader, test_dataloader, device, model, loss_fn, opt
             pred = model(X)
             loss = loss_fn(pred, y)
             loss.backward()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             
             global_step += 1
@@ -96,6 +98,9 @@ def main():
     parser.add_argument('--model', type=str, default="resnet-20")
     parser.add_argument('--dataset_name', type=str, default="CIFAR10")
     parser.add_argument('--save_path', type=str, default="checkpoint")
+    parser.add_argument('--scheduler', type=str, default="multistep", choices=["multistep", "cosine"])
+    parser.add_argument('--grad_clip', type=float, default=None)
+    parser.add_argument('--log_dir', type=str, default=None)
     args = parser.parse_args()
 
     train_dataloader, test_dataloader, num_classes = get_dataloader(args.batch_size, args.dataset_name)
@@ -114,26 +119,35 @@ def main():
         model = architecture.FractalNet(int(n), num_classes).to(device)
     elif model_name == "fractalnet_droppath":
         model = architecture.FractalNetDropPath(int(n), num_classes).to(device)
-        lr = 0.02       # lr = 0.1 설정시 발산 
     elif model_name == "vit_pretrained":
         model = architecture.VisionTransformer(int(n), num_classes).to(device)
 
     loss_fn = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[args.epochs // 2, args.epochs * 3 // 4], gamma=0.1)
-    tensorboard_writer = SummaryWriter()
+    if args.scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    elif args.scheduler == "multistep":
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[args.epochs // 2, args.epochs * 3 // 4], gamma=0.1)
+    
+    tensorboard_writer = SummaryWriter(log_dir=args.log_dir)
+    if args.log_dir:
+        print(f"TensorBoard log dir: {args.log_dir}")
 
-    train(
-        args.epochs,
-        train_dataloader,
-        test_dataloader,
-        device,
-        model,
-        loss_fn,
-        optimizer,
-        scheduler,
-        tensorboard_writer
-    )
+    try:
+        train(
+            args.epochs,
+            train_dataloader,
+            test_dataloader,
+            device,
+            model,
+            loss_fn,
+            optimizer,
+            scheduler,
+            tensorboard_writer,
+            grad_clip=args.grad_clip
+        )
+    finally:
+        tensorboard_writer.close()
     print("Done!")
 
     if args.save_path:

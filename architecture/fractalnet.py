@@ -6,33 +6,33 @@ def conv3x3(in_channels, out_channels):
 
 
 class FractalBlockDropPath(nn.Module):
-    def __init__(self, in_channels, out_channels, columns, drop_prob=0.15):
+    def __init__(self, in_channels, out_channels, columns, dropout=0.0, droppath=0.15):
         super().__init__()
         self.columns = columns
-        self.drop_prob = drop_prob
+        self.droppath = droppath
         
         if columns == 1:
             self.f = nn.Sequential(
-                nn.BatchNorm2d(in_channels),        # PreAct 구조 선택
-                nn.ReLU(inplace=True),
                 conv3x3(in_channels, out_channels),
-                # nn.Dropout2d(0.15)
+                nn.Dropout2d(dropout),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
             )
         else:
-            self.long1 = FractalBlockDropPath(in_channels, out_channels, columns - 1, drop_prob)   # 재귀 구조
-            self.long2 = FractalBlockDropPath(out_channels, out_channels, columns - 1, drop_prob)
+            self.long1 = FractalBlockDropPath(in_channels, out_channels, columns - 1, dropout, droppath)   # 재귀 구조
+            self.long2 = FractalBlockDropPath(out_channels, out_channels, columns - 1, dropout, droppath)
             self.short = nn.Sequential(
-                nn.BatchNorm2d(in_channels),
-                nn.ReLU(inplace=True),
                 conv3x3(in_channels, out_channels),
-                # nn.Dropout2d(0.15)
+                nn.Dropout2d(dropout),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
             )
 
     def _fractal_join(self, out_long, out_short):
-        if not self.training or self.drop_prob == 0:
+        if not self.training or self.droppath == 0:
             return (out_long + out_short) * 0.5     # simple avg (inferencing)
 
-        keep_prob = 1.0 - self.drop_prob
+        keep_prob = 1.0 - self.droppath
         mask = torch.bernoulli(out_long.new_tensor([keep_prob, keep_prob]))  # mini-batch shared mask
         if mask.sum() == 0:     # 모든 path가 drop된 경우 long path(idx=0) 살림
             mask[0] = 1.0
@@ -66,9 +66,9 @@ class FractalBlockDropPath(nn.Module):
         
 
 class FractalNetDropPath(nn.Module):
-    def __init__(self, num_layers, num_classes, blocks=5, columns=4, drop_prob=0.15, global_prob=0.5):
+    def __init__(self, num_layers, num_classes, blocks=5, columns=4, droppath=0.15, global_prob=0.5):
         super().__init__()
-        self.drop_prob = drop_prob
+        self.droppath = droppath
         self.global_prob = global_prob
         if num_layers == 20:
             self.columns = 3
@@ -77,15 +77,15 @@ class FractalNetDropPath(nn.Module):
         else:
             self.columns = columns
 
-        self.block1 = FractalBlockDropPath(3, 64, self.columns)
+        self.block1 = FractalBlockDropPath(3, 64, self.columns, dropout=0.0)
         self.pool1 = nn.MaxPool2d(2)
-        self.block2 = FractalBlockDropPath(64, 128, self.columns)
+        self.block2 = FractalBlockDropPath(64, 128, self.columns, dropout=0.1)
         self.pool2 = nn.MaxPool2d(2)
-        self.block3 = FractalBlockDropPath(128, 256, self.columns)
+        self.block3 = FractalBlockDropPath(128, 256, self.columns, dropout=0.2)
         self.pool3 = nn.MaxPool2d(2)
-        self.block4 = FractalBlockDropPath(256, 512, self.columns)
+        self.block4 = FractalBlockDropPath(256, 512, self.columns, dropout=0.3)
         self.pool4 = nn.MaxPool2d(2)
-        self.block5 = FractalBlockDropPath(512, 512, self.columns)
+        self.block5 = FractalBlockDropPath(512, 512, self.columns, dropout=0.4)
         self.pool5 = nn.MaxPool2d(2)
         
         # 32 -> 16 -> 8 -> 4 -> 2 -> 1 로 feature_map 줄어들어서 별도 pooling 필요 없음
@@ -102,7 +102,7 @@ class FractalNetDropPath(nn.Module):
     
     def forward(self, x):
         route_token = self.columns
-        if self.training and self.drop_prob > 0:
+        if self.training and self.droppath > 0:
             route_token = self._sample_route_token(x.device)
 
         x = self.block1(x, route_token)
