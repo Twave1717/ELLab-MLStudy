@@ -101,6 +101,7 @@ def main():
     parser.add_argument('--scheduler', type=str, default="multistep", choices=["multistep", "cosine"])
     parser.add_argument('--grad_clip', type=float, default=None)
     parser.add_argument('--log_dir', type=str, default=None)
+    parser.add_argument('--pretrained', action='store_true')
     args = parser.parse_args()
 
     train_dataloader, test_dataloader, num_classes = get_dataloader(args.batch_size, args.dataset_name)
@@ -119,6 +120,13 @@ def main():
         model = architecture.FractalNet(int(n), num_classes).to(device)
     elif model_name == "fractalnet_droppath":
         model = architecture.FractalNetDropPath(int(n), num_classes).to(device)
+    elif model_name == "mlp_mixer":
+        image_size = 448 if args.pretrained else 224
+        model = architecture.MLPMixer(num_classes, num_layers=int(n), image_size=image_size)
+        if args.pretrained:
+            model.load_mixer_b16_google_imagenet21k()
+            print("pre-trained mlp mixer B/16 is loaded")
+        model = model.to(device)
     elif model_name == "vit_pretrained":
         model = architecture.VisionTransformer(int(n), num_classes).to(device)
 
