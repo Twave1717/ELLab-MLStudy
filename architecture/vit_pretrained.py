@@ -1,3 +1,8 @@
+"""
+수정 필요. attention까지 손수 구현필요. 현재는 동작하지 않음.
+"""
+
+
 import torch.nn.functional as F
 from torch import nn
 from transformers import ViTForImageClassification
@@ -20,5 +25,5 @@ class VisionTransformer(nn.Module):
             mode="bilinear",
             align_corners=False,
         )
-        out = self.model(pixel_values=x).logits
+        out = self.model(pixel_values=x)
         return out
