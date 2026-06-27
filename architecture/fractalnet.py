@@ -1,3 +1,8 @@
+"""
+수정 필요. 현재 설계에 문제 있음.
+"""
+
+
 import torch
 from torch import nn
 
@@ -90,9 +95,9 @@ class FractalNetDropPath(nn.Module):
         
         # 32 -> 16 -> 8 -> 4 -> 2 -> 1 로 feature_map 줄어들어서 별도 pooling 필요 없음
         self.flatten = nn.Flatten()
-        self.fc = nn.Linear(512, num_classes)
 
         self._initialize_weights()
+        self.num_features = 512
 
     def _sample_route_token(self, device):
         if torch.rand((), device=device).item() < self.global_prob:      # local vs global
@@ -116,8 +121,7 @@ class FractalNetDropPath(nn.Module):
         x = self.block5(x, route_token)
         x = self.pool5(x)
         x = self.flatten(x)
-        out = self.fc(x)
-        return out
+        return x
 
     def _initialize_weights(self):
         for m in self.modules():
@@ -181,9 +185,9 @@ class FractalNet(nn.Module):
         
         # 32 -> 16 -> 8 -> 4 -> 2 -> 1 로 feature_map 줄어들어서 별도 pooling 필요 없음
         self.flatten = nn.Flatten()
-        self.fc = nn.Linear(512, num_classes)
 
         self._initialize_weights()
+        self.num_features = 512
 
     
     def forward(self, x):
@@ -198,8 +202,7 @@ class FractalNet(nn.Module):
         x = self.block5(x)
         x = self.pool5(x)
         x = self.flatten(x)
-        out = self.fc(x)
-        return out
+        return x
 
     def _initialize_weights(self):
         for m in self.modules():

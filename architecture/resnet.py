@@ -39,9 +39,9 @@ class ResNet(nn.Module):
         self.stage3 = nn.Sequential(*[ResBlock3x3(feature_base*4, feature_base*4) for _ in range(num_stage_layers-1)])
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.flatten = nn.Flatten()
-        self.fc = nn.Linear(feature_base*4, num_classes)
 
         self._initialize_weights()
+        self.num_features = feature_base * 4
 
     def forward(self, x):
         x = self.conv1(x)
@@ -54,8 +54,7 @@ class ResNet(nn.Module):
         x = self.stage3(x)
         x = self.avgpool(x)
         x = self.flatten(x)
-        logits = self.fc(x)
-        return logits
+        return x
 
     def _initialize_weights(self):
         for m in self.modules():

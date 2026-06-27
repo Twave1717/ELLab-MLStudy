@@ -68,9 +68,9 @@ class MLPMixer(nn.Module):
             ]
         )
         self.norm = nn.LayerNorm(hidden_dim)
-        self.fc = nn.Linear(hidden_dim, num_classes)
 
         self._initialize_weights()
+        self.num_features = hidden_dim
 
     def forward(self, x):
         if x.shape[-2:] != (self.image_size, self.image_size):
@@ -81,8 +81,7 @@ class MLPMixer(nn.Module):
         x = self.blocks(x)
         x = self.norm(x)
         x = x.mean(dim=1)                      # [B, S, C] -> [B, C]
-        logits = self.fc(x)                    # [B, C] -> [B, classes]
-        return logits
+        return x
 
     def _initialize_weights(self):
         for m in self.modules():

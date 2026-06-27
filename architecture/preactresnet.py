@@ -57,9 +57,9 @@ class PreActResNet(nn.Module):
         self.final_relu = nn.ReLU()
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.flatten = nn.Flatten()
-        self.fc = nn.Linear(feature_base*4, num_classes)
 
         self._initialize_weights()
+        self.num_features = feature_base * 4
 
     def forward(self, x):
         x = self.conv1(x)
@@ -70,8 +70,7 @@ class PreActResNet(nn.Module):
         x = self.final_relu(x)
         x = self.avgpool(x)
         x = self.flatten(x)
-        logits = self.fc(x)
-        return logits
+        return x
 
     def _initialize_weights(self):
         for m in self.modules():
