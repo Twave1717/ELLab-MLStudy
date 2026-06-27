@@ -1,4 +1,6 @@
 import architecture
+import methods
+from datasets import get_dataloader
 
 import os
 import argparse
@@ -7,8 +9,6 @@ from datetime import datetime
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from datasets import get_dataloader
-from methods.supervised_learning import SupervisedLearning
 
 def train(epochs, train_dataloader, test_dataloader, device, method, optimizer, scheduler, tensorboard_writer, grad_clip=None):
     global_step = 0
@@ -28,6 +28,9 @@ def train(epochs, train_dataloader, test_dataloader, device, method, optimizer, 
 
             optimizer.step()
             
+            if hasattr(method, "after_optimizer_step"):
+                method.after_optimizer_step()
+
             if global_step % 100 == 0:
                 print(f"Step [{global_step}/{len(train_dataloader)*epochs}] Loss: {loss.item():.4f}")
                 tensorboard_writer.add_scalar('Loss/train', loss.item(), global_step)
@@ -71,7 +74,7 @@ def main():
     parser.add_argument('--pretrained', action='store_true')
     args = parser.parse_args()
 
-    train_dataloader, test_dataloader, num_classes = get_dataloader(args.batch_size, args.dataset)
+    train_dataloader, test_dataloader, num_classes = get_dataloader(args.batch_size, args.dataset, args.method)
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using {device} device")
 
@@ -103,7 +106,9 @@ def main():
     ## choose learning method
     method_name = args.method
     if method_name == 'supervised':
-        method = SupervisedLearning(encoder=model, num_classes=num_classes).to(device)
+        method = methods.SupervisedLearning(encoder=model, num_classes=num_classes).to(device)
+    elif method_name == 'byol':
+        method = methods.BYOL(encoder=model).to(device)
 
 
     ## get optimizer & scheduler
