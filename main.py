@@ -72,6 +72,10 @@ def main():
     parser.add_argument('--grad_clip', type=float, default=None)
     parser.add_argument('--log_dir', type=str, default=None)
     parser.add_argument('--pretrained', action='store_true')
+    parser.add_argument('--moco_dim', type=int, default=128)
+    parser.add_argument('--moco_queue_size', type=int, default=4096)
+    parser.add_argument('--moco_momentum', type=float, default=0.999)
+    parser.add_argument('--moco_temperature', type=float, default=0.07)
     args = parser.parse_args()
 
     train_dataloader, test_dataloader, num_classes = get_dataloader(args.batch_size, args.dataset, args.method)
@@ -109,6 +113,14 @@ def main():
         method = methods.SupervisedLearning(encoder=model, num_classes=num_classes).to(device)
     elif method_name == 'byol':
         method = methods.BYOL(encoder=model).to(device)
+    elif method_name == 'moco':
+        method = methods.MoCo(
+            encoder=model,
+            dim=args.moco_dim,
+            K=args.moco_queue_size,
+            m=args.moco_momentum,
+            T=args.moco_temperature,
+        ).to(device)
 
 
     ## get optimizer & scheduler
