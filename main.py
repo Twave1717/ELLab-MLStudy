@@ -109,7 +109,8 @@ def main():
         method = methods.SupervisedLearning(encoder=model, num_classes=num_classes).to(device)
     elif method_name == 'byol':
         method = methods.BYOL(encoder=model).to(device)
-
+    elif method_name == 'rotnet':
+        method = methods.Rotnet(encoder=model).to(device)
 
     ## get optimizer & scheduler
     optimizer = torch.optim.SGD(method.parameters(), lr=lr, momentum=0.9, weight_decay=args.weight_decay)
