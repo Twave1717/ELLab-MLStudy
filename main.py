@@ -109,6 +109,8 @@ def main():
         method = methods.SupervisedLearning(encoder=model, num_classes=num_classes).to(device)
     elif method_name == 'byol':
         method = methods.BYOL(encoder=model).to(device)
+    elif method_name == 'simclr':
+        method = methods.simCLR(encoder=model).to(device)
 
 
     ## get optimizer & scheduler
