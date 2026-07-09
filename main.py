@@ -111,6 +111,8 @@ def main():
         method = methods.BYOL(encoder=model).to(device)
     elif method_name == 'simclr':
         method = methods.simCLR(encoder=model).to(device)
+    elif method_name == 'moco':
+        method = methods.MoCo(encoder=model).to(device)
 
 
     ## get optimizer & scheduler
