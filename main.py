@@ -72,6 +72,7 @@ def main():
     parser.add_argument('--grad_clip', type=float, default=None)
     parser.add_argument('--log_dir', type=str, default=None)
     parser.add_argument('--pretrained', action='store_true')
+    parser.add_argument('--encoder_checkpoint', type=str, default=None)
     args = parser.parse_args()
 
     train_dataloader, test_dataloader, num_classes = get_dataloader(args.batch_size, args.dataset, args.method)
@@ -101,7 +102,13 @@ def main():
         model = model.to(device)
     elif model_name == "vit_pretrained":
         model = architecture.VisionTransformer(int(n), num_classes).to(device)
+    elif model_name == 'rotnet':
+        model = architecture.RotNet(int(n)).to(device)
 
+    if args.encoder_checkpoint is not None:
+        state_dict = torch.load(args.encoder_checkpoint, map_location=device)
+        model.load_state_dict(state_dict)
+        print(f"Loaded encoder checkpoint from {args.encoder_checkpoint}")
 
     ## choose learning method
     method_name = args.method
@@ -109,6 +116,10 @@ def main():
         method = methods.SupervisedLearning(encoder=model, num_classes=num_classes).to(device)
     elif method_name == 'byol':
         method = methods.BYOL(encoder=model).to(device)
+    elif method_name == 'rotnet':
+        method = methods.RotNetMethod(encoder=model).to(device)
+    elif method_name == 'rotnet_eval':
+        method = methods.RotNetNonLinearEval(encoder=model,num_classes=num_classes).to(device)
 
 
     ## get optimizer & scheduler

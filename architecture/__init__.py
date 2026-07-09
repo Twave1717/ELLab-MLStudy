@@ -4,3 +4,4 @@ from .densenet import DenseNet
 from .fractalnet import FractalNet, FractalNetDropPath
 from .mlp_mixer import MLPMixer
 from .vit_pretrained import VisionTransformer
+from .rotnet import RotNet
