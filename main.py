@@ -120,6 +120,8 @@ def main():
         method = methods.RotNetMethod(encoder=model).to(device)
     elif method_name == 'rotnet_eval':
         method = methods.RotNetNonLinearEval(encoder=model,num_classes=num_classes).to(device)
+    elif method_name == 'moco':
+        method = methods.MoCo(encoder=model).to(device)
 
 
     ## get optimizer & scheduler
