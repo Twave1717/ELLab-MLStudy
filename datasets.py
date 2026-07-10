@@ -61,7 +61,9 @@ def get_dataloader(batch_size, dataset_name, method='supervised'):
         ToTensor(),
         Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
-    if method != 'supervised':
+    if method in ['rotnet', 'rotnet_eval']:
+        pass
+    elif method != 'supervised':
         ## supervised가 아닐 경우, ((x1, x2), y) 형태로 반환
         train_transform = make_two_view_transform(train_transform)
         test_transform = make_two_view_transform(test_transform)
@@ -72,7 +74,7 @@ def get_dataloader(batch_size, dataset_name, method='supervised'):
     num_classes = len(training_data.classes)
 
     for X, y in test_dataloader:
-        if method == 'supervised':
+        if method in ['supervised', 'rotnet', 'rotnet_eval']:
             print(f"Shape of X [B, C, H, W]: {X.shape}")
         else:
             print(f"Shape of X1 [B, C, H, W]: {X[0].shape}")
