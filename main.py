@@ -116,13 +116,14 @@ def main():
         method = methods.SupervisedLearning(encoder=model, num_classes=num_classes).to(device)
     elif method_name == 'byol':
         method = methods.BYOL(encoder=model).to(device)
+    elif method_name == 'simclr':
+        method = methods.simCLR(encoder=model).to(device)
     elif method_name == 'rotnet':
         method = methods.RotNetMethod(encoder=model).to(device)
     elif method_name == 'rotnet_eval':
         method = methods.RotNetNonLinearEval(encoder=model,num_classes=num_classes).to(device)
     elif method_name == 'moco':
         method = methods.MoCo(encoder=model).to(device)
-
 
     ## get optimizer & scheduler
     optimizer = torch.optim.SGD(method.parameters(), lr=lr, momentum=0.9, weight_decay=args.weight_decay)
