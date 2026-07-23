@@ -1,5 +1,6 @@
 import architecture
 import methods
+from eval import RotNetNonLinearEval
 from datasets import get_dataloader
 
 import os
@@ -121,7 +122,7 @@ def main():
     elif method_name == 'rotnet':
         method = methods.RotNetMethod(encoder=model).to(device)
     elif method_name == 'rotnet_eval':
-        method = methods.RotNetNonLinearEval(encoder=model,num_classes=num_classes).to(device)
+        method = RotNetNonLinearEval(encoder=model, num_classes=num_classes).to(device)
     elif method_name == 'moco':
         method = methods.MoCo(encoder=model).to(device)
 

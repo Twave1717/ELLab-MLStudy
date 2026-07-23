@@ -22,7 +22,6 @@ class MLP(nn.Module):
 class BYOL(nn.Module):
     def __init__(self, encoder):
         super().__init__()
-        self.encoder = encoder
         self.online_encoder = encoder
         self.target_encoder = copy.deepcopy(encoder)
         self.online_projector = MLP(encoder.num_features)
@@ -30,6 +29,10 @@ class BYOL(nn.Module):
         self.predictor = MLP(256)
 
         self.freeze()
+
+    @property
+    def encoder(self):
+        return self.online_encoder
 
     def forward(self, x1, x2):
         x1 = self.online_encoder(x1)
