@@ -21,6 +21,10 @@ class MoCo(nn.Module):
         self.queue = nn.functional.normalize(self.queue, dim=0)
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
 
+    @property
+    def encoder(self):
+        return self.encoder_q
+
     def freeze_key(self):
         for param in self.encoder_k.parameters():
             param.requires_grad = False
