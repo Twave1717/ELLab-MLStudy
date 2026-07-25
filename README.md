@@ -49,6 +49,11 @@ chmod +x tensorboard.sh
 ## Evaluation
 
 ```bash
+# CLIP zero-shot evaluation
+uv run python evaluate.py clip cifar10
+```
+
+```bash
 # RotNet pretraining
 uv run python train.py \
   --method rotnet \
@@ -58,11 +63,12 @@ uv run python train.py \
 
 ```bash
 # RotNet nonlinear evaluation
-uv run python evaluate.py \
+uv run python evaluate.py rotnet \
   checkpoint/.../encoder.pth
 ```
 
-현재 evaluation은 `rotnet-4`와 CIFAR-10만 지원합니다.
+CLIP zero-shot은 지정한 데이터셋의 test split을 사용합니다. RotNet
+evaluation은 현재 `rotnet-4`와 CIFAR-10만 지원합니다.
 
 ## Architectures
 
@@ -139,8 +145,8 @@ CLIP은 Hugging Face의 pretrained `openai/clip-vit-base-patch16`을
 | Text projection | 고정 | 고정 |
 | Logit scale | 학습 | 고정 |
 
-데이터셋의 class name을 그대로 tokenization하며 별도의 prompt template은
-사용하지 않습니다.
+CLIP은 각 데이터셋 파일의 `template`과 class name으로 prompt를 만듭니다.
+예를 들어 UCF101은 `a photo of a person doing {}.`을 사용합니다.
 
 ### LoRA
 
@@ -180,9 +186,10 @@ ImageNet은 `data/imagenet`, UCF101은 `data/ucf101` 아래에 원본 파일을
 직접 준비해야 합니다. UCF101은 video classification 대신 각 clip의 첫
 frame을 image classification 입력으로 사용합니다.
 
-공식 train/test split이 없는 Caltech101, EuroSAT, SUN397은 seed 0으로
-고정한 70:30 split을 사용합니다. DTD와 Flowers102는 train과 validation
-split을 합쳐 학습합니다.
+공식 validation split이 있는 DTD, FGVCAircraft, Flowers102는 이를 그대로
+사용합니다. 공식 test split만 있는 데이터셋은 train의 10%를 validation으로
+분리합니다. 별도 split이 없는 Caltech101, EuroSAT, SUN397은 70/10/20으로
+나눕니다. 모든 무작위 분할과 학습은 `GLOBAL_SEED = 2026`을 사용합니다.
 
 ## Preprocessing
 

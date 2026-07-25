@@ -1,19 +1,23 @@
 import os
+import re
 
 from torch.utils.data import Dataset
 from torchvision.datasets import UCF101
 from torchvision.transforms.functional import to_pil_image
-from .utils import DatasetSpec
+from .utils import DatasetSpec, split_dataset
 
 
 dataset_dir = "ucf101"
+template = "a photo of a person doing {}."
 
 
 class UCF101FrameDataset(Dataset):
     def __init__(self, dataset, transform):
         self.dataset = dataset
         self.transform = transform
-        self.classes = dataset.classes
+        self.classes = [
+            re.sub(r"(?<!^)(?=[A-Z])", " ", name) for name in dataset.classes
+        ]
 
     def __len__(self):
         return len(self.dataset)
@@ -46,10 +50,11 @@ def build_ucf101(root, train_transform, test_transform):
         fold=1,
         train=False,
     )
-    return (
+    return split_dataset(
         UCF101FrameDataset(train_dataset, train_transform),
+        UCF101FrameDataset(train_dataset, test_transform),
         UCF101FrameDataset(test_dataset, test_transform),
     )
 
 
-DATASET = DatasetSpec(build_ucf101)
+DATASET = DatasetSpec(build_ucf101, template)

@@ -21,7 +21,7 @@ def get_dataloader(
         two_views=method in {"byol", "moco", "simclr"},
     )
 
-    training_data, test_data = dataset.build(
+    training_data, validation_data, test_data = dataset.build(
         root,
         train_transform,
         test_transform,
@@ -31,9 +31,13 @@ def get_dataloader(
         batch_size=batch_size,
         shuffle=True,
     )
+    validation_dataloader = DataLoader(
+        validation_data,
+        batch_size=batch_size,
+    )
     test_dataloader = DataLoader(
         test_data,
         batch_size=batch_size,
     )
     num_classes = len(training_data.classes)
-    return train_dataloader, test_dataloader, num_classes
+    return train_dataloader, validation_dataloader, test_dataloader, num_classes

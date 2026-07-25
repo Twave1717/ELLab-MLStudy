@@ -8,10 +8,22 @@ from torch.utils.tensorboard import SummaryWriter
 import architecture
 import methods
 from datasets import get_dataloader
+from datasets.vision.utils import GLOBAL_SEED
 from tuning import apply_lora, lora_state_dict, mark_only_lora_as_trainable
 
 
-def train(epochs, train_loader, test_loader, device, method, optimizer, scheduler, writer, grad_clip=None):
+def train(
+    epochs,
+    train_loader,
+    validation_loader,
+    test_loader,
+    device,
+    method,
+    optimizer,
+    scheduler,
+    writer,
+    grad_clip=None,
+):
     global_step = 0
 
     for epoch in range(1, epochs + 1):
@@ -36,10 +48,12 @@ def train(epochs, train_loader, test_loader, device, method, optimizer, schedule
             global_step += 1
 
         scheduler.step()
-        test(epoch, test_loader, device, method, writer)
+        test(epoch, validation_loader, device, method, writer, "validation")
+
+    test(epochs, test_loader, device, method, writer, "test")
 
 
-def test(epoch, loader, device, method, writer):
+def test(epoch, loader, device, method, writer, split):
     method.eval()
     total_loss, total_correct, total_size = 0, 0, 0
 
@@ -52,9 +66,9 @@ def test(epoch, loader, device, method, writer):
 
     loss = total_loss / total_size
     accuracy = total_correct / total_size
-    print(f"{epoch} Epochs Error:\n Accuracy: {accuracy * 100:.1f}%, Avg loss: {loss:.6f}\n")
-    writer.add_scalar("Loss/test", loss, epoch)
-    writer.add_scalar("Accuracy/test", accuracy * 100, epoch)
+    print(f"{split.title()} - Accuracy: {accuracy * 100:.1f}%, Avg loss: {loss:.6f}")
+    writer.add_scalar(f"Loss/{split}", loss, epoch)
+    writer.add_scalar(f"Accuracy/{split}", accuracy * 100, epoch)
 
 
 def parse_args():
@@ -88,7 +102,7 @@ def parse_args():
 def build_method(args, num_classes, dataset):
     if args.method == "clip":
         model, tokenizer = architecture.load_clip(args.model)
-        return methods.CLIP(model, tokenizer, dataset.classes)
+        return methods.CLIP(model, tokenizer, dataset.classes, dataset.template)
 
     encoder = architecture.build_encoder(args.model, args.pretrained)
     if args.method == "supervised":
@@ -155,10 +169,11 @@ def save_checkpoint(args, method):
 
 def main():
     args = parse_args()
+    torch.manual_seed(GLOBAL_SEED)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     args.model = architecture.CLIP_MODEL if args.method == "clip" else args.model or "resnet-20"
 
-    train_loader, test_loader, num_classes = get_dataloader(
+    train_loader, validation_loader, test_loader, num_classes = get_dataloader(
         args.batch_size,
         args.dataset,
         args.method,
@@ -176,6 +191,7 @@ def main():
         train(
             args.epochs,
             train_loader,
+            validation_loader,
             test_loader,
             device,
             method,

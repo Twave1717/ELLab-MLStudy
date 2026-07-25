@@ -3,12 +3,12 @@ from torch import nn
 
 
 class CLIP(nn.Module):
-    def __init__(self, clip_model, tokenizer, classnames):
+    def __init__(self, clip_model, tokenizer, classnames, template):
         super().__init__()
 
         classnames = [names[0].replace("_", " ") for names in classnames]
         tokens = tokenizer(
-            classnames,
+            [template.format(name) for name in classnames],
             padding=True,
             return_tensors="pt",
         )

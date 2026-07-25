@@ -1,9 +1,10 @@
 import os
 from torchvision.datasets import ImageNet
-from .utils import DatasetSpec
+from .utils import DatasetSpec, split_dataset
 
 
 dataset_dir = "imagenet"
+template = "a photo of a {}."
 
 
 def build_imagenet(root, train_transform, test_transform):
@@ -14,14 +15,20 @@ def build_imagenet(root, train_transform, test_transform):
         split="train",
         transform=train_transform,
     )
+    val_dataset = ImageNet(
+        root=dataset_root,
+        split="train",
+        transform=test_transform,
+    )
     test_dataset = ImageNet(
         root=dataset_root,
         split="val",
         transform=test_transform,
     )
     train_dataset.classes = [names[0] for names in train_dataset.classes]
+    val_dataset.classes = train_dataset.classes
     test_dataset.classes = train_dataset.classes
-    return train_dataset, test_dataset
+    return split_dataset(train_dataset, val_dataset, test_dataset)
 
 
-DATASET = DatasetSpec(build_imagenet)
+DATASET = DatasetSpec(build_imagenet, template)

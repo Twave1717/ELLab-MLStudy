@@ -1,9 +1,10 @@
 import os
 from torchvision.datasets import DTD
-from .utils import DatasetSpec, concat_datasets
+from .utils import DatasetSpec
 
 
 dataset_dir = "dtd"
+template = "{} texture."
 
 
 def build_dtd(root, train_transform, test_transform):
@@ -18,7 +19,7 @@ def build_dtd(root, train_transform, test_transform):
         dataset_root,
         split="val",
         download=True,
-        transform=train_transform,
+        transform=test_transform,
     )
     test_dataset = DTD(
         dataset_root,
@@ -26,7 +27,7 @@ def build_dtd(root, train_transform, test_transform):
         download=True,
         transform=test_transform,
     )
-    return concat_datasets(train_dataset, val_dataset), test_dataset
+    return train_dataset, val_dataset, test_dataset
 
 
-DATASET = DatasetSpec(build_dtd)
+DATASET = DatasetSpec(build_dtd, template)

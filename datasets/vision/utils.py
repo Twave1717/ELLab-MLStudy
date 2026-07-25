@@ -1,41 +1,51 @@
 from dataclasses import dataclass
+
 import torch
-from torch.utils.data import ConcatDataset, Subset
+from torch.utils.data import Subset
+
+
+GLOBAL_SEED = 2026
 
 
 @dataclass(frozen=True)
 class DatasetSpec:
     builder: object
+    template: str
     crop_size: int = 224
 
     def build(self, root, train_transform, test_transform):
-        train, test = self.builder(
-            root,
-            train_transform,
-            test_transform,
-        )
+        datasets = self.builder(root, train_transform, test_transform)
+        train = datasets[0]
         classes = [(name,) for name in train.classes]
-        train.classes = classes
-        test.classes = classes
-        return train, test
+        for dataset in datasets:
+            dataset.classes = classes
+            dataset.template = self.template
+        return datasets
 
 
-def concat_datasets(*datasets):
-    combined = ConcatDataset(datasets)
-    combined.classes = datasets[0].classes
-    return combined
+def _split(dataset, indices):
+    subset = Subset(dataset, indices)
+    subset.classes = (
+        dataset.classes if hasattr(dataset, "classes") else dataset.categories
+    )
+    return subset
 
 
-def random_split_datasets(train_dataset, test_dataset, train_ratio=0.7):
-    generator = torch.Generator().manual_seed(0)
+def split_dataset(train_dataset, eval_dataset, test_dataset=None):
+    generator = torch.Generator().manual_seed(GLOBAL_SEED)
     indices = torch.randperm(len(train_dataset), generator=generator).tolist()
-    split = int(len(indices) * train_ratio)
+    if test_dataset is not None:
+        split = int(len(indices) * 0.9)
+        return (
+            _split(train_dataset, indices[:split]),
+            _split(eval_dataset, indices[split:]),
+            test_dataset,
+        )
 
-    train = Subset(train_dataset, indices[:split])
-    test = Subset(test_dataset, indices[split:])
-    classes = getattr(train_dataset, "classes", None)
-    if classes is None:
-        classes = train_dataset.categories
-    train.classes = classes
-    test.classes = classes
-    return train, test
+    train_end = int(len(indices) * 0.7)
+    val_end = int(len(indices) * 0.8)
+    return (
+        _split(train_dataset, indices[:train_end]),
+        _split(eval_dataset, indices[train_end:val_end]),
+        _split(eval_dataset, indices[val_end:]),
+    )

@@ -1,9 +1,10 @@
 import os
 from torchvision.datasets import CIFAR10
-from .utils import DatasetSpec
+from .utils import DatasetSpec, split_dataset
 
 
 dataset_dir = "cifar10"
+template = "a photo of a {}."
 
 
 def build_cifar10(root, train_transform, test_transform):
@@ -14,13 +15,19 @@ def build_cifar10(root, train_transform, test_transform):
         download=True,
         transform=train_transform,
     )
+    val_dataset = CIFAR10(
+        root=dataset_root,
+        train=True,
+        download=True,
+        transform=test_transform,
+    )
     test_dataset = CIFAR10(
         root=dataset_root,
         train=False,
         download=True,
         transform=test_transform,
     )
-    return train_dataset, test_dataset
+    return split_dataset(train_dataset, val_dataset, test_dataset)
 
 
-DATASET = DatasetSpec(build_cifar10, crop_size=32)
+DATASET = DatasetSpec(build_cifar10, template, crop_size=32)
