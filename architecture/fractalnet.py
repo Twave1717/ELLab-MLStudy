@@ -71,7 +71,7 @@ class FractalBlockDropPath(nn.Module):
         
 
 class FractalNetDropPath(nn.Module):
-    def __init__(self, num_layers, num_classes, blocks=5, columns=4, droppath=0.15, global_prob=0.5):
+    def __init__(self, num_layers, blocks=5, columns=4, droppath=0.15, global_prob=0.5):
         super().__init__()
         self.droppath = droppath
         self.global_prob = global_prob
@@ -163,7 +163,7 @@ class FractalBlock(nn.Module):
         
 
 class FractalNet(nn.Module):
-    def __init__(self, num_layers, num_classes, blocks=5, columns=4):
+    def __init__(self, num_layers, blocks=5, columns=4):
         super().__init__()
         if num_layers == 20:
             self.columns = 3

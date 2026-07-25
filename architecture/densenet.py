@@ -49,7 +49,7 @@ class TransitionLayer(nn.Module):
         return self.transition(x)
 
 class DenseNet(nn.Module):
-    def __init__(self, num_layers, num_classes, growth_rate=24, reduction=0.5):
+    def __init__(self, num_layers, growth_rate=24, reduction=0.5):
         super().__init__()
         num_stage_layers = (num_layers - 4) // 6
         in_channels = 2 * growth_rate

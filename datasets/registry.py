@@ -1,39 +1,31 @@
-from .caltech101 import build_caltech101
-from .cifar10 import build_cifar10
-from .dtd import build_dtd
-from .eurosat import build_eurosat
-from .fgvc import build_fgvc
-from .food101 import build_food101
-from .imagenet import build_imagenet
-from .imagenette import build_imagenette
-from .oxford_flowers import build_oxford_flowers
-from .oxford_pets import build_oxford_pets
-from .stanford_cars import build_stanford_cars
-from .sun397 import build_sun397
-from .ucf101 import build_ucf101
+from .vision.caltech101 import DATASET as CALTECH101
+from .vision.cifar10 import DATASET as CIFAR10
+from .vision.dtd import DATASET as DTD
+from .vision.eurosat import DATASET as EUROSAT
+from .vision.fgvc import DATASET as FGVC
+from .vision.food101 import DATASET as FOOD101
+from .vision.imagenet import DATASET as IMAGENET
+from .vision.imagenette import DATASET as IMAGENETTE
+from .vision.oxford_flowers import DATASET as OXFORD_FLOWERS
+from .vision.oxford_pets import DATASET as OXFORD_PETS
+from .vision.stanford_cars import DATASET as STANFORD_CARS
+from .vision.sun397 import DATASET as SUN397
+from .vision.ucf101 import DATASET as UCF101
 
 
-class DatasetConfig:
-    def __init__(self, builder, crop_size):
-        self.builder = builder
-        self.crop_size = crop_size
-
-
-def get_dataset_config(name):
-    DATASET_REGISTRY = {
-        "caltech101": DatasetConfig(builder=build_caltech101, crop_size=224),
-        "cifar10": DatasetConfig(builder=build_cifar10, crop_size=32),
-        "dtd": DatasetConfig(builder=build_dtd, crop_size=224),
-        "eurosat": DatasetConfig(builder=build_eurosat, crop_size=224),
-        "fgvc": DatasetConfig(builder=build_fgvc, crop_size=224),
-        "food101": DatasetConfig(builder=build_food101, crop_size=224),
-        "imagenet": DatasetConfig(builder=build_imagenet, crop_size=224),
-        "imagenette": DatasetConfig(builder=build_imagenette, crop_size=160),
-        "imagenet-ilsvrc2012": DatasetConfig(builder=build_imagenet, crop_size=224),
-        "oxford_flowers": DatasetConfig(builder=build_oxford_flowers, crop_size=224),
-        "oxford_pets": DatasetConfig(builder=build_oxford_pets, crop_size=224),
-        "stanford_cars": DatasetConfig(builder=build_stanford_cars, crop_size=224),
-        "sun397": DatasetConfig(builder=build_sun397, crop_size=224),
-        "ucf101": DatasetConfig(builder=build_ucf101, crop_size=224),
-    }
-    return DATASET_REGISTRY[name]
+DATASETS = {
+    "caltech101": CALTECH101,
+    "cifar10": CIFAR10,
+    "dtd": DTD,
+    "eurosat": EUROSAT,
+    "fgvc": FGVC,
+    "food101": FOOD101,
+    "imagenet": IMAGENET,
+    "imagenette": IMAGENETTE,
+    "imagenet-ilsvrc2012": IMAGENET,
+    "oxford_flowers": OXFORD_FLOWERS,
+    "oxford_pets": OXFORD_PETS,
+    "stanford_cars": STANFORD_CARS,
+    "sun397": SUN397,
+    "ucf101": UCF101,
+}
