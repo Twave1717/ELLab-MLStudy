@@ -9,7 +9,7 @@ import architecture
 import methods
 from datasets import get_dataloader
 from datasets.vision.utils import GLOBAL_SEED
-from tuning import apply_lora, lora_state_dict, mark_only_lora_as_trainable
+from peft import apply_lora, lora_state_dict, mark_only_lora_as_trainable
 
 
 def train(
@@ -22,7 +22,8 @@ def train(
     optimizer,
     scheduler,
     writer,
-    grad_clip=None,
+    on_best,
+    grad_clip=None
 ):
     global_step = 0
 
@@ -48,7 +49,10 @@ def train(
             global_step += 1
 
         scheduler.step()
-        test(epoch, validation_loader, device, method, writer, "validation")
+        validation_accuracy = test(epoch, validation_loader, device, method, writer, "validation")
+        if epoch == 1 or validation_accuracy > best_accuracy:
+            best_accuracy = validation_accuracy
+            on_best()
 
     test(epochs, test_loader, device, method, writer, "test")
 
@@ -69,20 +73,17 @@ def test(epoch, loader, device, method, writer, split):
     print(f"{split.title()} - Accuracy: {accuracy * 100:.1f}%, Avg loss: {loss:.6f}")
     writer.add_scalar(f"Loss/{split}", loss, epoch)
     writer.add_scalar(f"Accuracy/{split}", accuracy * 100, epoch)
+    return accuracy
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
 
     # experiment
-    parser.add_argument(
-        '--method',
-        choices=["supervised", "byol", "simclr", "rotnet", "moco", "clip"],
-        default="supervised",
-    )
+    parser.add_argument('--method', choices=["supervised", "byol", "simclr", "rotnet", "moco", "clip"], default="supervised")
     parser.add_argument('--model', choices=architecture.MODEL_CHOICES)
     parser.add_argument('--dataset', default="cifar10")
-    parser.add_argument('--tuning', choices=["none", "lora"], default="none")
+    parser.add_argument('--peft', choices=["none", "lora"], default="none")
     parser.add_argument('--pretrained', action='store_true')
 
     # training
@@ -117,8 +118,8 @@ def build_method(args, num_classes, dataset):
         return methods.MoCo(encoder)
 
 
-def configure_tuning(args, method):
-    if args.tuning == "lora":
+def configure_peft(args, method):
+    if args.peft == "lora":
         replaced = apply_lora(method.encoder)
         mark_only_lora_as_trainable(method)
         print(f"Applied LoRA to {replaced} Linear layers")
@@ -140,27 +141,19 @@ def build_scheduler(args, optimizer):
     name = args.scheduler or ("cosine" if args.method == "clip" else "multistep")
     if name == "cosine":
         return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
-    return torch.optim.lr_scheduler.MultiStepLR(
-        optimizer,
-        [args.epochs // 2, args.epochs * 3 // 4],
-        gamma=0.1,
-    )
+    milestones = [args.epochs // 2, args.epochs * 3 // 4]
+    return torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=0.1)
 
 
-def save_checkpoint(args, method):
-    model_name = args.model.rsplit("/", 1)[-1]
-    run_name = f"{model_name}-{args.method}-{args.epochs}-{datetime.now():%m%d_%H%M}"
-    save_dir = os.path.join(args.save_path, run_name)
-    os.makedirs(save_dir, exist_ok=True)
-
-    if args.tuning == "lora":
-        path = os.path.join(save_dir, "lora.pth")
+def save_checkpoint(args, method, save_dir, best=False):
+    if args.peft == "lora":
+        path = os.path.join(save_dir, "best_lora.pth" if best else "lora.pth")
         torch.save({"state_dict": lora_state_dict(method), "model": args.model}, path)
         print(f"Saved LoRA state to {path}")
         return
 
-    encoder_path = os.path.join(save_dir, "encoder.pth")
-    method_path = os.path.join(save_dir, "method.pth")
+    encoder_path = os.path.join(save_dir, "best_encoder.pth" if best else "encoder.pth")
+    method_path = os.path.join(save_dir, "best_method.pth" if best else "method.pth")
     torch.save(method.encoder.state_dict(), encoder_path)
     torch.save(method.state_dict(), method_path)
     print(f"Saved encoder state to {encoder_path}")
@@ -179,13 +172,20 @@ def main():
         args.method,
         root=args.data_root,
         pretrained=args.pretrained,
-        model_name=args.model,
+        model_name=args.model
     )
     method = build_method(args, num_classes, train_loader.dataset)
-    configure_tuning(args, method)
+    configure_peft(args, method)
     method.to(device)
     optimizer = build_optimizer(args, method)
     scheduler = build_scheduler(args, optimizer)
+    model_name = args.model.replace("/", "-")
+    run_name = f"{model_name}-{args.method}-{args.epochs}-{datetime.now():%m%d_%H%M}"
+    save_dir = os.path.join(args.save_path, run_name)
+    os.makedirs(save_dir, exist_ok=True)
+
+    def save_best():
+        save_checkpoint(args, method, save_dir, True)
 
     with SummaryWriter() as writer:
         train(
@@ -198,10 +198,11 @@ def main():
             optimizer,
             scheduler,
             writer,
-            args.grad_clip,
+            save_best,
+            args.grad_clip
         )
 
-    save_checkpoint(args, method)
+    save_checkpoint(args, method, save_dir)
     print("Done!")
 
 

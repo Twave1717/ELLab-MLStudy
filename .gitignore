@@ -2,4 +2,9 @@
 /checkpoint
 *__pycache__
 *.log
+/logs/
 .python-version
+temp_scripts
+tests
+PLAN.md
+temp/

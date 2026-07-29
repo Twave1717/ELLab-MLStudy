@@ -18,6 +18,11 @@ class UCF101FrameDataset(Dataset):
         self.classes = [
             re.sub(r"(?<!^)(?=[A-Z])", " ", name) for name in dataset.classes
         ]
+        self.targets = []
+        for index in range(len(dataset)):
+            video_index, _ = dataset.video_clips.get_clip_location(index)
+            sample_index = dataset.indices[video_index]
+            self.targets.append(dataset.samples[sample_index][1])
 
     def __len__(self):
         return len(self.dataset)

@@ -26,11 +26,24 @@ uv run python train.py \
 uv run python train.py \
   --method clip \
   --dataset cifar10 \
-  --tuning lora
+  --peft lora
 ```
 
 ```bash
-# 학습 기록은 `runs/`에 저장
+# 2SFS LayerNorm
+uv run python train_2sfs.py \
+  --dataset cifar10 \
+  --shots 1
+
+# LoRA를 사용하려면 추가
+uv run python train_2sfs.py \
+  --dataset cifar10 \
+  --shots 1 \
+  --peft lora
+```
+
+```bash
+# `train.py` 학습 기록은 `runs/`에 저장
 chmod +x tensorboard.sh
 ./tensorboard.sh
 ```
@@ -45,12 +58,15 @@ chmod +x tensorboard.sh
 | `moco` | ResNet, PreActResNet, DenseNet, MLP-Mixer, ViT, RotNet | FractalNet 제외 |
 | `rotnet` | ResNet, PreActResNet, DenseNet, MLP-Mixer, ViT, RotNet | FractalNet 제외 |
 | `clip` | CLIP ViT-B/16 | Hugging Face pretrained model 고정 |
+| `2sfs` | CLIP ViT-B/16 | `train_2sfs.py`에서 실행 |
 
 ## Evaluation
 
 ```bash
 # CLIP zero-shot evaluation
-uv run python evaluate.py clip cifar10
+uv run python evaluate.py clip cifar10 \
+  --batch_size 64 \
+  --data_root data
 ```
 
 ```bash
@@ -147,6 +163,8 @@ CLIP은 Hugging Face의 pretrained `openai/clip-vit-base-patch16`을
 
 CLIP은 각 데이터셋 파일의 `template`과 class name으로 prompt를 만듭니다.
 예를 들어 UCF101은 `a photo of a person doing {}.`을 사용합니다.
+Text encoder가 고정되어 있으므로 class prompt embedding은 모델 생성 시 한
+번만 계산해 buffer에 보관하고 모든 학습 및 평가 batch에서 재사용합니다.
 
 ### LoRA
 
@@ -165,6 +183,9 @@ dropout = 0.25
 ## Datasets
 
 기본 데이터 경로는 `data/`이며 `--data_root`로 변경할 수 있습니다.
+각 데이터셋은 `data/<dataset-name>/` 아래에 저장됩니다. 예를 들어
+CIFAR-10은 `data/cifar10/cifar-10-batches-py`, Imagenette는
+`data/imagenette/imagenette2-160`을 사용합니다.
 
 | 이름 | torchvision dataset | 다운로드 |
 | --- | --- | --- |
@@ -210,7 +231,7 @@ BYOL, SimCLR, MoCo는 같은 transform을 두 번 적용해 두 개의 view를
 | `--method` | `supervised` | 학습 방법 |
 | `--model` | method에 따라 선택 | 일반 method는 `resnet-20`, CLIP은 pretrained CLIP |
 | `--dataset` | `cifar10` | 데이터셋 |
-| `--tuning` | `none` | `none` 또는 `lora` |
+| `--peft` | `none` | `none` 또는 `lora` |
 | `--batch_size` | `128` | Batch size |
 | `--epochs` | `200` | Epoch 수 |
 | `--lr` | method에 따라 선택 | CLIP `2e-4`, 나머지 `0.1` |
@@ -222,7 +243,8 @@ BYOL, SimCLR, MoCo는 같은 transform을 두 번 적용해 두 개의 view를
 | `--save_path` | `checkpoint` | 학습 결과 저장 경로 |
 
 일반 method는 SGD와 momentum 0.9를 사용합니다. CLIP은 AdamW를
-사용합니다.
+사용합니다. 매 epoch의 validation accuracy가 가장 높은 checkpoint를
+`best_` prefix로 저장합니다. 학습 종료 후 마지막 checkpoint도 별도로 저장합니다.
 
 ```bash
 # 전체 옵션 예시
@@ -230,7 +252,7 @@ uv run python train.py \
   --method clip \ # supervised, byol, simclr, rotnet, moco, clip
   --model openai/clip-vit-base-patch16 \ # resnet-20, preactresnet-20, densenet-40, fractalnet-20/40, fractalnet_droppath-20/40, mlp_mixer-12, vit-12, rotnet-4, resnet-18/34/50/101/152
   --dataset cifar10 \ # caltech101, dtd, eurosat, fgvc, food101, imagenet, imagenet-ilsvrc2012, imagenette, oxford_flowers, oxford_pets, stanford_cars, sun397, ucf101
-  --tuning lora \ # none, lora
+  --peft lora \ # none, lora
   --pretrained \ # torchvision ResNet 또는 vit-12에서 사용, CLIP에서는 사용하지 않음
   --epochs 200 \ # epoch 수
   --batch_size 128 \ # batch size
@@ -249,14 +271,17 @@ uv run python train.py \
 ```text
 checkpoint/<model>-<method>-<epochs>-<time>/
 ├── encoder.pth
-└── method.pth
+├── method.pth
+├── best_encoder.pth
+└── best_method.pth
 ```
 
 LoRA 학습 결과:
 
 ```text
 checkpoint/<model>-clip-<epochs>-<time>/
-└── lora.pth
+├── lora.pth
+└── best_lora.pth
 ```
 
 LoRA checkpoint에는 adapter weight와 사용한 CLIP model 이름만
@@ -268,5 +293,5 @@ LoRA checkpoint에는 adapter weight와 사용한 CLIP model 이름만
 - RotNet nonlinear evaluation 구현
 - CLIP architecture는 Hugging Face 구현 사용
 - PyTorch 기반 CLIP, ViT architecture 직접 구현은 미완료
-- 2SFS 미구현
-- Text LoRA, LayerNorm tuning, QLoRA 미구현
+- all-to-all 2SFS-LayerNorm/LoRA 구현
+- 일반 CLIP Text LoRA와 QLoRA 미구현

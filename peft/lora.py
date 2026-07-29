@@ -14,16 +14,9 @@ class LoRALinear(nn.Module):
         self.base = base
         self.scaling = ALPHA / math.sqrt(RANK)
         self.dropout = nn.Dropout(DROPOUT)
-        self.lora_a = nn.Linear(
-            base.in_features,
-            RANK,
-            bias=False,
-        )
-        self.lora_b = nn.Linear(
-            RANK,
-            base.out_features,
-            bias=False,
-        )
+        self.lora_a = nn.Linear(base.in_features, RANK, bias=False)
+        self.lora_b = nn.Linear(RANK, base.out_features, bias=False)
+        self.to(base.weight)
         nn.init.zeros_(self.lora_b.weight)
 
     def forward(self, inputs):
@@ -32,18 +25,14 @@ class LoRALinear(nn.Module):
         )
 
 
-def apply_lora(vision_model):
+def apply_lora(encoder):
     replaced = 0
 
-    for layer in vision_model.encoder.layers:
+    for layer in encoder.encoder.layers:
         attention = layer.self_attn
         for name in ("q_proj", "k_proj", "v_proj"):
             projection = getattr(attention, name)
-            setattr(
-                attention,
-                name,
-                LoRALinear(projection),
-            )
+            setattr(attention, name, LoRALinear(projection))
             replaced += 1
 
     return replaced
@@ -55,6 +44,7 @@ def mark_only_lora_as_trainable(model):
         if isinstance(module, LoRALinear):
             module.lora_a.requires_grad_(True)
             module.lora_b.requires_grad_(True)
+    return [parameter for parameter in model.parameters() if parameter.requires_grad]
 
 
 def lora_state_dict(model):
