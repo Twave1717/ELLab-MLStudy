@@ -41,7 +41,6 @@ class MixerBlock(nn.Module):
 class MLPMixer(nn.Module):
     def __init__(
         self,
-        num_classes,
         num_layers=12,
         image_size=224,
         patch_size=16,
@@ -89,68 +88,3 @@ class MLPMixer(nn.Module):
                 nn.init.kaiming_normal_(m.weight)
             elif isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
-
-
-    def load_mixer_b16_google_imagenet21k(self):
-        MIXER_B16_GOOGLE_IMAGENET21K_URL = "https://huggingface.co/timm/mixer_b16_224.goog_in21k/resolve/main/pytorch_model.bin"
-        base_image_size = 224
-        
-        def remove_prefix(text, prefix):
-            if text.startswith(prefix):
-                return text[len(prefix):]
-            return text
-
-        k = self.image_size // base_image_size
-        k2 = k * k
-
-        def expand_block_diagonal(value, target_shape):
-            if k2 == 1:
-                return value
-
-            # bias: [Ds] -> [K^2 * Ds], e.g. [384] -> [1536]
-            if value.ndim == 1 and target_shape[0] != value.shape[0]:
-                return value.repeat(k2)
-
-            # weight: [Ds, S] -> [K^2 * Ds, K^2 * S], e.g. [384, 196] -> [1536, 784]
-            if value.ndim == 2 and target_shape != value.shape:
-                return torch.block_diag(*[value for _ in range(k2)])
-
-            return value
-
-        checkpoint = torch.hub.load_state_dict_from_url(
-            MIXER_B16_GOOGLE_IMAGENET21K_URL,
-            map_location="cpu",
-            progress=True,
-            file_name="mixer_b16_224_goog_in21k.pth",
-        )
-        if "state_dict" in checkpoint:
-            checkpoint = checkpoint["state_dict"]
-        elif "model" in checkpoint:
-            checkpoint = checkpoint["model"]
-
-        model_state = self.state_dict()
-        pretrained_state = {}
-        for key, value in checkpoint.items():
-            key = remove_prefix(key, "module.")
-            key = remove_prefix(key, "model.")
-
-            if key.startswith("head."):
-                continue
-
-            key = key.replace("stem.proj.", "stem.")
-            key = key.replace(".norm1.", ".token_norm.")
-            key = key.replace(".mlp_tokens.fc1.", ".token_mlp.layers.0.")
-            key = key.replace(".mlp_tokens.fc2.", ".token_mlp.layers.3.")
-            key = key.replace(".norm2.", ".channel_norm.")
-            key = key.replace(".mlp_channels.fc1.", ".channel_mlp.layers.0.")
-            key = key.replace(".mlp_channels.fc2.", ".channel_mlp.layers.3.")
-
-            if key in model_state and "token_mlp.layers" in key:
-                value = expand_block_diagonal(value, model_state[key].shape)
-
-            if key in model_state and model_state[key].shape == value.shape:
-                pretrained_state[key] = value
-
-        model_state.update(pretrained_state)
-        self.load_state_dict(model_state)
-        return len(pretrained_state)
