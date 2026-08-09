@@ -88,6 +88,9 @@ evaluation은 현재 `rotnet-4`와 CIFAR-10만 지원합니다.
 
 ## Architectures
 
+모델 architecture, 학습 method, evaluation head, PEFT 구현은 각각
+`src/architecture`, `src/methods`, `src/eval`, `src/peft`에 있습니다.
+
 ### From scratch
 
 다음은 프로젝트에 등록된 from-scratch architecture입니다.
