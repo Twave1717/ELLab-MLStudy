@@ -2,11 +2,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-
 class TwoStageCLIP(nn.Module):
     def __init__(self, clip_model, tokenizer, classnames, template):
         super().__init__()
-        classnames = [classname[0].replace("_", " ") for classname in classnames]
+        classnames = [classname[0].replace("_", " ") if isinstance(classname, tuple) else classname.replace("_", " ") for classname in classnames]
         tokens = tokenizer(
             [template.format(name) for name in classnames],
             padding=True,
@@ -34,7 +33,7 @@ class TwoStageCLIP(nn.Module):
         return F.normalize(features, dim=-1)
 
     def encode_classnames(self, classnames):
-        names = [classname[0].replace("_", " ") for classname in classnames]
+        names = [classname[0].replace("_", " ") if isinstance(classname, tuple) else classname.replace("_", " ") for classname in classnames]
         tokens = self.tokenizer([self.template.format(name) for name in names], padding=True, return_tensors="pt").to(self.input_ids.device)
         outputs = self.model.text_model(input_ids=tokens["input_ids"], attention_mask=tokens["attention_mask"])
         features = self.model.text_projection(outputs.pooler_output)
@@ -60,3 +59,12 @@ class TwoStageCLIP(nn.Module):
 
     def stage_two_logits(self, images):
         return self.classifier_logits(images, self.classifier)
+
+    # 추가: 다양한 손실 함수(KgCoOp 등)를 지원하기 위한 공통 인터페이스
+    def compute_loss(self, images, labels, stage):
+        if stage == "stage1":
+            logits = self.stage_one_logits(images)
+        else:
+            logits = self.stage_two_logits(images)
+        loss = F.cross_entropy(logits, labels)
+        return loss, logits

@@ -13,7 +13,7 @@ from methods import TwoStageCLIP
 from peft import apply_lora, mark_only_layernorm_as_trainable, mark_only_lora_as_trainable
 
 
-def train_stage(logits_fn, parameters, loader, steps, lr, device, name, writer, on_epoch_end=None):
+def train_stage(method, parameters, loader, steps, lr, device, name, writer, on_epoch_end=None):
     optimizer = torch.optim.AdamW(parameters, lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps, eta_min=1e-6)
     scaler = torch.amp.GradScaler()
@@ -24,7 +24,8 @@ def train_stage(logits_fn, parameters, loader, steps, lr, device, name, writer, 
             optimizer.zero_grad()
             images, labels = images.to(device), labels.to(device)
             with torch.amp.autocast(device):
-                loss = F.cross_entropy(logits_fn(images), labels)
+                # 수정: 단일 CrossEntropy 대신 method의 compute_loss 호출
+                loss, logits = method.compute_loss(images, labels, stage=name)
 
             scale = scaler.get_scale()
             scaler.scale(loss).backward()
@@ -91,10 +92,16 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
     stage_one_steps = int(total_steps * args.stage_one_ratio)
     method.to(device)
 
+    # 파라미터 분기 처리 수정
     if args.peft == "lora":
         apply_lora(method.model.vision_model)
         apply_lora(method.model.text_model)
         parameters = mark_only_lora_as_trainable(method.model)
+    elif args.peft == "kgcoop":
+        # KgCoOp의 경우 백본 고정 & 프롬프트 파라미터만 학습
+        for param in method.model.parameters():
+            param.requires_grad_(False)
+        parameters = list(method.prompt_learner.parameters())
     else:
         parameters = mark_only_layernorm_as_trainable(method.model)
 
@@ -103,7 +110,10 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         validation_base_loader, validation_new_loader = validation_loader
         method.eval()
         with torch.no_grad():
-            base_classifier = method.encode_text()
+            if args.peft == "kgcoop":
+                base_classifier = method.encode_learned_text()
+            else:
+                base_classifier = method.encode_text()
             new_classifier = method.encode_classnames(validation_new_loader.dataset.classes)
         breakpoint_base_loader = build_breakpoint_loader(method, validation_base_loader, base_classifier, device, "stage1 [0] base")
         breakpoint_new_loader = build_breakpoint_loader(method, validation_new_loader, new_classifier, device, "stage1 [0] new")
@@ -115,7 +125,10 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
             nonlocal previous_step, previous_base_accuracy, previous_new_accuracy
             method.eval()
             with torch.no_grad():
-                base_classifier = method.encode_text()
+                if args.peft == "kgcoop":
+                    base_classifier = method.encode_learned_text()
+                else:
+                    base_classifier = method.encode_text()
                 new_classifier = method.encode_classnames(breakpoint_new_loader.dataset.classes)
             base_accuracy = evaluate(method, breakpoint_base_loader, base_classifier, device, f"stage1 [{cur_step}] base")
             new_accuracy = evaluate(method, breakpoint_new_loader, new_classifier, device, f"stage1 [{cur_step}] new")
@@ -135,7 +148,7 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
 
     method.train()
     train_stage(
-        method.stage_one_logits,
+        method, # logits_fn 대신 method 객체 자체를 전달
         parameters,
         train_loader,
         stage_one_steps,
@@ -149,7 +162,7 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
     method.initialize_classifier()
     method.eval()
     train_stage(
-        method.stage_two_logits,
+        method, # logits_fn 대신 method 전달
         [method.classifier],
         train_loader,
         total_steps - stage_one_steps,
@@ -180,7 +193,9 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="cifar10")
     parser.add_argument("--shots", type=int, choices=[1, 2, 4, 8, 16], default=1)
-    parser.add_argument("--peft", choices=["ln", "lora"], default="ln")
+    parser.add_argument("--peft", choices=["ln", "lora", "kgcoop"], default="ln") # kgcoop 추가
+    parser.add_argument("--n_ctx", type=int, default=8, help="KgCoOp context length") # n_ctx 추가
+    parser.add_argument("--w", type=float, default=8.0, help="KgCoOp discrepancy loss weight") # w 추가
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--steps_per_shot", type=int, default=300)
@@ -204,12 +219,26 @@ def main():
         setting=args.setting
     )
     model, tokenizer = load_clip(CLIP_MODEL)
-    method = TwoStageCLIP(
-        model,
-        tokenizer,
-        train_loader.dataset.classes,
-        train_loader.dataset.template
-    )
+    
+    # PEFT 종류에 따라 메서드 초기화
+    if args.peft == "kgcoop":
+        from peft.kgcoop import TwoStageKgCoOp
+        method = TwoStageKgCoOp(
+            model,
+            tokenizer,
+            train_loader.dataset.classes,
+            train_loader.dataset.template,
+            n_ctx=args.n_ctx,
+            w=args.w
+        )
+    else:
+        method = TwoStageCLIP(
+            model,
+            tokenizer,
+            train_loader.dataset.classes,
+            train_loader.dataset.template
+        )
+        
     run_name = f"{args.dataset}-{args.peft}-{args.shots}shot-ratio{args.stage_one_ratio}"
     if args.setting == "base2new":
         run_name += "-base2new"

@@ -83,7 +83,7 @@ def parse_args():
     parser.add_argument('--method', choices=["supervised", "byol", "simclr", "rotnet", "moco", "clip"], default="supervised")
     parser.add_argument('--model', choices=architecture.MODEL_CHOICES)
     parser.add_argument('--dataset', default="cifar10")
-    parser.add_argument('--peft', choices=["none", "lora"], default="none")
+    parser.add_argument('--peft', choices=["none", "lora", "kgcoop"], default="none")
     parser.add_argument('--pretrained', action='store_true')
 
     # training
@@ -103,6 +103,10 @@ def parse_args():
 def build_method(args, num_classes, dataset):
     if args.method == "clip":
         model, tokenizer = architecture.load_clip(args.model)
+        if args.peft == "kgcoop":
+            # KgCoOp 설정 (일반 훈련이 아닌 2SFS를 추천하지만 범용성 보장)
+            from peft.kgcoop import TwoStageKgCoOp
+            return TwoStageKgCoOp(model, tokenizer, dataset.classes, dataset.template)
         return methods.CLIP(model, tokenizer, dataset.classes, dataset.template)
 
     encoder = architecture.build_encoder(args.model, args.pretrained)
@@ -120,9 +124,18 @@ def build_method(args, num_classes, dataset):
 
 def configure_peft(args, method):
     if args.peft == "lora":
-        replaced = apply_lora(method.encoder)
+        if hasattr(method, 'encoder'):
+            replaced = apply_lora(method.encoder)
+        else:
+            replaced = apply_lora(method.model)
         mark_only_lora_as_trainable(method)
         print(f"Applied LoRA to {replaced} Linear layers")
+    elif args.peft == "kgcoop":
+        # CLIP 백본 고정
+        for param in method.model.parameters():
+            param.requires_grad_(False)
+        method.prompt_learner.requires_grad_(True)
+        print("Applied KgCoOp (frozen backbone, training prompt_learner)")
 
 
 def build_optimizer(args, method):
@@ -150,6 +163,11 @@ def save_checkpoint(args, method, save_dir, best=False):
         path = os.path.join(save_dir, "best_lora.pth" if best else "lora.pth")
         torch.save({"state_dict": lora_state_dict(method), "model": args.model}, path)
         print(f"Saved LoRA state to {path}")
+        return
+    elif args.peft == "kgcoop":
+        path = os.path.join(save_dir, "best_kgcoop.pth" if best else "kgcoop.pth")
+        torch.save({"prompt_learner": method.prompt_learner.state_dict(), "model": args.model}, path)
+        print(f"Saved KgCoOp state to {path}")
         return
 
     encoder_path = os.path.join(save_dir, "best_encoder.pth" if best else "encoder.pth")
