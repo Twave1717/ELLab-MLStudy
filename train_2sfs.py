@@ -10,14 +10,19 @@ from architecture import CLIP_MODEL, load_clip
 from datasets import get_dataloader
 from datasets.vision.utils import GLOBAL_SEED
 from methods import TwoStageCLIP
-from peft import apply_lora, mark_only_layernorm_as_trainable, mark_only_lora_as_trainable
+from peft import apply_lora, mark_only_layernorm_as_trainable, mark_only_lora_as_trainable, mark_only_half_layernorm_as_trainable
 
 
-def train_stage(logits_fn, parameters, loader, steps, lr, device, name, writer, on_epoch_end=None):
+def train_stage(args, logits_fn, parameters, loader, steps, lr, device, name, writer, on_epoch_end=None):
     optimizer = torch.optim.AdamW(parameters, lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps, eta_min=1e-6)
     scaler = torch.amp.GradScaler()
     cur_step = 0
+    beta = 0.98
+
+    args.loss_ema = None; args.prev_loss_ema = None
+    args.loss_best = float('inf'); args.loss_bad = 0
+    args.stopped = False
 
     while cur_step < steps:
         for batch_index, (images, labels) in enumerate(loader, 1):
@@ -35,10 +40,32 @@ def train_stage(logits_fn, parameters, loader, steps, lr, device, name, writer, 
 
             scheduler.step()
             cur_step += 1
+
+            args.loss_ema = loss.item() if args.loss_ema is None else beta * args.loss_ema + (1-beta) * loss.item()
+
+            if cur_step > steps * 0.2:
+                if args.loss_ema < args.loss_best - 1e-4:
+                    args.loss_best = args.loss_ema
+                    args.loss_bad = 0
+                else:
+                    args.loss_bad += 1
+                loss_ok = args.loss_bad >= args.loss_patience
+
+                if args.stage_engineering and loss_ok and args.allow_stop : args.stopped = True
+            else:
+                args.prev_loss_ema = args.loss_ema
+
+
             print(f"{name} [{cur_step}/{steps}] Loss: {loss.item():.4f}")
             writer.add_scalar(f"Loss/{name}", loss.item(), cur_step)
-            if cur_step == steps:
+
+            if args.stopped or (cur_step >= steps):
                 break
+            
+        if args.stopped or (cur_step >= steps):
+            args.last_stage_step = cur_step
+            break
+
         if on_epoch_end and batch_index == len(loader):
             on_epoch_end(cur_step)
 
@@ -95,8 +122,10 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         apply_lora(method.model.vision_model)
         apply_lora(method.model.text_model)
         parameters = mark_only_lora_as_trainable(method.model)
-    else:
+    if args.peft == "ln":
         parameters = mark_only_layernorm_as_trainable(method.model)
+    if args.peft == "ln_half":
+        parameters = mark_only_half_layernorm_as_trainable(method.model)
 
     on_epoch_end = None
     if args.setting == "base2new":
@@ -133,8 +162,11 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
 
         on_epoch_end = track_breakpoint
 
+
     method.train()
+    args.allow_stop = True
     train_stage(
+        args,
         method.stage_one_logits,
         parameters,
         train_loader,
@@ -146,13 +178,17 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         on_epoch_end
     )
 
+    args.stopped = False
+    args.allow_stop = False
+
     method.initialize_classifier()
     method.eval()
     train_stage(
+        args,
         method.stage_two_logits,
         [method.classifier],
         train_loader,
-        total_steps - stage_one_steps,
+        total_steps - args.last_stage_step,
         args.lr,
         device,
         "stage2",
@@ -180,13 +216,15 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="cifar10")
     parser.add_argument("--shots", type=int, choices=[1, 2, 4, 8, 16], default=1)
-    parser.add_argument("--peft", choices=["ln", "lora"], default="ln")
+    parser.add_argument("--peft", choices=["ln", "lora", "ln_half"], default="ln")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--steps_per_shot", type=int, default=300)
     parser.add_argument("--stage_one_ratio", type=float, default=0.6)
     parser.add_argument("--setting", choices=["standard", "base2new"], default="standard")
     parser.add_argument("--data_root", default="data")
+    parser.add_argument("--stage_engineering", type=int, default=False)
+    parser.add_argument("--loss_patience", type=int, default=60)
     return parser.parse_args()
 
 

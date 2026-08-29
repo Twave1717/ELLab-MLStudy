@@ -5,3 +5,4 @@ from .lora import (
     mark_only_lora_as_trainable
 )
 from .layernorm import mark_only_layernorm_as_trainable
+from .ln_half import mark_only_half_layernorm_as_trainable
