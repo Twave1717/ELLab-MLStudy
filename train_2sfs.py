@@ -108,14 +108,16 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
     if args.peft == "lora":
         apply_lora(method.model.vision_model)
         apply_lora(method.model.text_model)
-        parameters = mark_only_lora_as_trainable(method.model)
+        mark_only_lora_as_trainable(method.model)
     else:
-        parameters = mark_only_layernorm_as_trainable(method.model)
+        mark_only_layernorm_as_trainable(method.model)
+
+    parameters = [parameter for parameter in method.model.parameters() if parameter.requires_grad]
+    if not parameters:
+        raise RuntimeError(f"No trainable parameters found after applying PEFT mode: {args.peft}")
 
     gradient_gate = None
     if args.gradient_gate == "abs_identity":
-        if args.peft != "ln":
-            raise ValueError("abs_identity is only supported with --peft ln")
         gradient_gate = AbsIdentityGate(parameters)
         gradient_gate.initialize(method.stage_one_logits, train_loader.dataset, device)
 

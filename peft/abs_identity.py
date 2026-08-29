@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 
 class AbsIdentityGate:
-    """Scale each LayerNorm update by q = E[|g|]^2 / E[g^2]."""
+    """Scale each trainable parameter update by q = E[|g|]^2 / E[g^2]."""
 
     def __init__(
         self,
