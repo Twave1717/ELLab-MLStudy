@@ -12,11 +12,7 @@ from src.architecture import CLIP_MODEL, load_clip
 from src.methods import TwoStageCLIP
 from src.peft import (
     AbsIdentityGate,
-    RANK,
-    TARGETS,
-    LoRAProOptimizer,
-    apply_lora_to_clip,
-    lora_modules,
+    apply_lora,
     mark_only_layernorm_as_trainable,
     mark_only_lora_as_trainable,
 )
@@ -24,13 +20,10 @@ from src.peft import (
 
 def train_stage(
     logits_fn, parameters, loader, steps, lr, device, name, writer,
-    on_epoch_end=None, gradient_gate=None, optimizer=None, eta_min=1e-6,
+    on_epoch_end=None, gradient_gate=None,
 ):
-    if optimizer is None:
-        optimizer = torch.optim.AdamW(parameters, lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, steps, eta_min=eta_min
-    )
+    optimizer = torch.optim.AdamW(parameters, lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps, eta_min=1e-6)
     scaler = torch.amp.GradScaler()
     cur_step = 0
 
@@ -118,13 +111,8 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
     method.to(device)
 
     if args.peft == "lora":
-        apply_lora_to_clip(
-            method.model,
-            targets=args.lora_targets,
-            blocks=args.lora_blocks,
-            modality=args.lora_modality,
-            rank=args.lora_rank,
-        )
+        apply_lora(method.model.vision_model)
+        apply_lora(method.model.text_model)
         mark_only_lora_as_trainable(method.model)
     else:
         mark_only_layernorm_as_trainable(method.model)
@@ -174,13 +162,6 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         on_epoch_end = track_breakpoint
 
     method.train()
-    stage_one_optimizer = None
-    stage_one_eta_min = 1e-6
-    if args.peft == "lora" and args.stage1_optimizer == "lora_pro":
-        stage_one_optimizer = LoRAProOptimizer(
-            lora_modules(method.model), args.lora_pro_lr
-        )
-        stage_one_eta_min = args.lora_pro_lr / 100
     train_stage(
         method.stage_one_logits,
         parameters,
@@ -191,9 +172,7 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         "stage1",
         writer,
         on_epoch_end,
-        gradient_gate,
-        optimizer=stage_one_optimizer,
-        eta_min=stage_one_eta_min,
+        gradient_gate
     )
 
     method.initialize_classifier()
@@ -238,24 +217,7 @@ def parse_args():
     parser.add_argument("--stage_one_ratio", type=float, default=0.6)
     parser.add_argument("--setting", choices=["standard", "base2new"], default="standard")
     parser.add_argument("--data_root", default="data")
-    parser.add_argument(
-        "--lora_targets", nargs="+", choices=TARGETS, default=["q", "k", "v"]
-    )
-    parser.add_argument(
-        "--lora_blocks", choices=["all", "odd", "even"], default="all"
-    )
-    parser.add_argument(
-        "--lora_modality", choices=["both", "vision", "text"], default="both"
-    )
-    parser.add_argument("--lora_rank", type=int, default=RANK)
-    parser.add_argument(
-        "--stage1_optimizer", choices=["adamw", "lora_pro"], default="adamw"
-    )
-    parser.add_argument("--lora_pro_lr", type=float, default=2e-6)
-    args = parser.parse_args()
-    if args.stage1_optimizer == "lora_pro" and args.peft != "lora":
-        parser.error("--stage1_optimizer lora_pro requires --peft lora")
-    return args
+    return parser.parse_args()
 
 
 def main():
@@ -283,20 +245,6 @@ def main():
         run_name += f"-{args.gradient_gate}"
     if args.setting == "base2new":
         run_name += "-base2new"
-    if args.peft == "lora" and (
-        args.lora_targets != ["q", "k", "v"]
-        or args.lora_blocks != "all"
-        or args.lora_modality != "both"
-        or args.lora_rank != RANK
-        or args.stage1_optimizer != "adamw"
-    ):
-        targets = "".join(args.lora_targets)
-        run_name += (
-            f"-{targets}-{args.lora_blocks}-{args.lora_modality}"
-            f"-r{args.lora_rank}-{args.stage1_optimizer}"
-        )
-        if args.stage1_optimizer == "lora_pro":
-            run_name += f"-lr{args.lora_pro_lr:g}"
     with SummaryWriter(f"runs/2sfs/{run_name}") as writer:
         train_2sfs(
             args,
