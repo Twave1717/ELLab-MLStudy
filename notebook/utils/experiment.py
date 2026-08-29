@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 from src.architecture import CLIP_MODEL, load_clip
 from src.methods.twostage import TwoStageCLIP
 from src.peft import (
+    AbsIdentityGate,
     apply_lora,
     mark_only_layernorm_as_trainable,
     mark_only_lora_as_trainable,
@@ -42,29 +43,55 @@ SUBMISSION_PREDICTION_SCHEMA = "id_class_key_v1"
 @dataclass(frozen=True)
 class ExperimentConfig:
     repo_root: Path
+    data_root: Path | None = None
+    kaggle_root: Path | None = None
     datasets: tuple[str, ...] = DATASETS
     shots: int = 16
     peft: str = "ln"
+    gradient_gate: str = "none"
     batch_size: int = 32
     lr: float = 2e-4
     steps_per_shot: int = 300
     probe_every_steps: int = 10
     seed: int = 2026
     device: str = "auto"
-    amp: bool = True
+    amp: bool = False
     num_workers: int = 0
     print_every_steps: int = 100
     model_name: str = CLIP_MODEL
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "repo_root", Path(self.repo_root).resolve())
+        repo_root = Path(self.repo_root).resolve()
+        object.__setattr__(self, "repo_root", repo_root)
+        data_root = Path(self.data_root) if self.data_root is not None else Path("data")
+        if not data_root.is_absolute():
+            data_root = repo_root / data_root
+        object.__setattr__(self, "data_root", data_root.resolve())
+
+        if self.kaggle_root is None:
+            candidates = (
+                repo_root / "kaggle",
+                repo_root / "archive/03_kaggle_dataset_and_manifests",
+            )
+            kaggle_root = next((path for path in candidates if path.is_dir()), candidates[0])
+        else:
+            kaggle_root = Path(self.kaggle_root)
+            if not kaggle_root.is_absolute():
+                kaggle_root = repo_root / kaggle_root
+        object.__setattr__(self, "kaggle_root", kaggle_root.resolve())
         object.__setattr__(self, "datasets", tuple(self.datasets))
         if not self.repo_root.is_dir():
             raise FileNotFoundError(self.repo_root)
+        if not self.data_root.is_dir():
+            raise FileNotFoundError(self.data_root)
+        if not self.kaggle_root.is_dir():
+            raise FileNotFoundError(self.kaggle_root)
         if not self.datasets or set(self.datasets) - set(DATASETS):
             raise ValueError(f"Unsupported datasets: {self.datasets}")
         if self.shots not in {1, 2, 4, 8, 16} or self.peft not in FIXED_RATIOS:
             raise ValueError("Invalid shots or PEFT method")
+        if self.gradient_gate not in {"none", "abs_identity"}:
+            raise ValueError(f"Invalid gradient gate: {self.gradient_gate}")
         if (
             min(self.batch_size, self.lr, self.steps_per_shot, self.probe_every_steps)
             <= 0
@@ -84,6 +111,8 @@ class ExperimentConfig:
     def as_json(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["repo_root"] = str(self.repo_root)
+        payload["data_root"] = str(self.data_root)
+        payload["kaggle_root"] = str(self.kaggle_root)
         payload["datasets"] = list(self.datasets)
         payload["fixed_stage_one_ratio"] = self.fixed_ratio
         payload["total_steps"] = self.total_steps
@@ -97,6 +126,7 @@ class BreakpointRun:
     train_loader: DataLoader
     validation: tuple[ManifestDataset, ManifestDataset]
     device: torch.device
+    gradient_gate: AbsIdentityGate | None = None
 
 
 def seed_everything(seed: int) -> None:
@@ -167,7 +197,18 @@ def prepare_breakpoint(config: ExperimentConfig, dataset: str) -> BreakpointRun:
     validation = load_validation_datasets(config, dataset, eval_transform)
     method, parameters = prepare_method(config, train_data, device)
     loader = make_loader(train_data, config, shuffle=True, seed_offset=101)
-    return BreakpointRun(method, parameters, loader, validation, device)
+    gradient_gate = None
+    if config.gradient_gate == "abs_identity":
+        gradient_gate = AbsIdentityGate(parameters)
+        gradient_gate.initialize(
+            method.stage_one_logits,
+            train_data,
+            device,
+            amp_enabled=bool(config.amp and device.type == "cuda"),
+        )
+    return BreakpointRun(
+        method, parameters, loader, validation, device, gradient_gate
+    )
 
 
 def _metrics(correct: Mapping[str, int], total: Mapping[str, int]) -> dict[str, Any]:
@@ -227,6 +268,7 @@ def train_steps(
     device: torch.device,
     name: str,
     probe: Callable[[int], None] | None = None,
+    gradient_gate: AbsIdentityGate | None = None,
 ) -> None:
     if steps <= 0:
         return
@@ -246,17 +288,30 @@ def train_steps(
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
-                loss = F.cross_entropy(logits_fn(images), labels)
+                losses = F.cross_entropy(
+                    logits_fn(images),
+                    labels,
+                    reduction="none" if gradient_gate else "mean",
+                )
+                loss = losses.mean() if gradient_gate else losses
+            previous = q = None
+            if gradient_gate:
+                previous, q = gradient_gate.prepare(losses, step + 1)
             scale_before = scaler.get_scale()
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             if scaler.get_scale() < scale_before:
                 continue
+            if gradient_gate:
+                gradient_gate.apply(previous, q)
             scheduler.step()
             step += 1
             if step == 1 or step == steps or step % config.print_every_steps == 0:
-                print(f"{name} [{step}/{steps}] loss={loss.item():.5f}")
+                q_text = (
+                    "" if q is None else f" q={q.mean().item():.5f}"
+                )
+                print(f"{name} [{step}/{steps}] loss={loss.item():.5f}{q_text}")
             if probe and (step % config.probe_every_steps == 0 or step == steps):
                 probe(step)
             if step >= steps:
@@ -285,12 +340,19 @@ def save_json(path: str | Path, value: Mapping[str, Any]) -> Path:
     return target
 
 
-def artifact_path(dataset: str, peft: str, shots: int, kind: str) -> Path:
-    return ARTIFACT_DIR / f"{kind}_{dataset}_{peft}_{shots}shot.json"
+def artifact_path(
+    dataset: str,
+    peft: str,
+    shots: int,
+    kind: str,
+    gradient_gate: str = "none",
+) -> Path:
+    gate_suffix = "" if gradient_gate == "none" else f"_{gradient_gate}"
+    return ARTIFACT_DIR / f"{kind}_{dataset}_{peft}{gate_suffix}_{shots}shot.json"
 
 
 def breakpoint_signature(config: ExperimentConfig) -> dict[str, Any]:
-    return {
+    signature = {
         "datasets": list(config.datasets),
         "shots": config.shots,
         "peft": config.peft,
@@ -306,12 +368,22 @@ def breakpoint_signature(config: ExperimentConfig) -> dict[str, Any]:
         "resolved_device": str(resolve_device(config)),
         "model_name": config.model_name,
     }
+    # Keep no-gate signatures compatible with the completed baseline runs.
+    if config.gradient_gate != "none":
+        signature["gradient_gate"] = config.gradient_gate
+    return signature
 
 
 def open_breakpoint_checkpoint(
     config: ExperimentConfig, dataset: str, restart: bool
 ) -> tuple[Path, dict[str, Any]]:
-    path = artifact_path(dataset, config.peft, config.shots, "breakpoints")
+    path = artifact_path(
+        dataset,
+        config.peft,
+        config.shots,
+        "breakpoints",
+        config.gradient_gate,
+    )
     signature = breakpoint_signature(config)
     if path.is_file() and not restart:
         payload = load_json(path)
@@ -344,7 +416,11 @@ def build_breakpoint_result(
     )
     return {
         "dataset": dataset,
-        "selection_rule": "earliest probe with maximum full official validation H",
+        "selection_rule": (
+            "earliest probe with maximum full official validation Novel accuracy"
+        ),
+        "selection_metric": "novel_accuracy",
+        "selection_smoothing": "none",
         "validation_protocol": "complete raw official validation split",
         "validation_source": str(validation_manifest_path(config, dataset)),
         "test_labels_read": False,
@@ -354,13 +430,128 @@ def build_breakpoint_result(
             "base": len(validation[0]),
             "novel": len(validation[1]),
         },
+        "probe_count": len(records),
+        "probe_record_fields": [
+            "step",
+            "ratio",
+            "base_accuracy",
+            "novel_accuracy",
+            "harmonic_mean",
+            "base_total",
+            "novel_total",
+        ],
         "probe_records": records,
         **selected,
         "manual_override": None,
         "selected_step": selected["auto_step"],
         "selected_ratio": selected["auto_ratio"],
-        "selected_source": "automatic",
+        "selected_source": "automatic_novel_peak",
     }
+
+
+def summarize_breakpoint_records(
+    records: Sequence[Mapping[str, float | int]],
+) -> dict[str, float | int]:
+    """Select the earliest Novel peak while retaining HM peak metadata."""
+
+    if not records:
+        raise ValueError("Cannot summarize an empty breakpoint trajectory")
+    ordered = sorted(records, key=lambda row: int(row["step"]))
+    hm_peak = max(ordered, key=lambda row: row["harmonic_mean"])
+    novel_peak = max(ordered, key=lambda row: row["novel_accuracy"])
+    return {
+        "auto_step": novel_peak["step"],
+        "auto_ratio": novel_peak["ratio"],
+        "auto_novel_accuracy": novel_peak["novel_accuracy"],
+        "auto_harmonic_mean": novel_peak["harmonic_mean"],
+        "auto_base_accuracy": novel_peak["base_accuracy"],
+        "hm_peak_step": hm_peak["step"],
+        "hm_peak_ratio": hm_peak["ratio"],
+        "hm_peak_value": hm_peak["harmonic_mean"],
+        "hm_peak_base_accuracy": hm_peak["base_accuracy"],
+        "hm_peak_novel_accuracy": hm_peak["novel_accuracy"],
+        "novel_peak_step": novel_peak["step"],
+        "novel_peak_ratio": novel_peak["ratio"],
+        "novel_peak_value": novel_peak["novel_accuracy"],
+        "novel_peak_base_accuracy": novel_peak["base_accuracy"],
+        "novel_peak_harmonic_mean": novel_peak["harmonic_mean"],
+    }
+
+
+def find_optimized_breakpoint(
+    config: ExperimentConfig,
+    dataset: str,
+) -> dict[str, Any]:
+    """Find the earliest full-validation Novel peak on the Kaggle split.
+
+    This is an offline validation oracle for research.  It is deliberately
+    separate from any train-only, causal stopping rule.
+    """
+
+    run = prepare_breakpoint(config, dataset)
+    validation = run.validation
+    total_steps = config.total_steps
+    records: list[dict[str, float | int]] = []
+
+    print(
+        f"{dataset}: validation B={len(validation[0])}, "
+        f"N={len(validation[1])}, total={sum(map(len, validation))}"
+    )
+
+    def probe(step: int) -> None:
+        run.method.eval()
+        with torch.inference_mode():
+            classifiers = (
+                run.method.encode_text(),
+                run.method.encode_classnames(validation[1].classes),
+            )
+        metrics = evaluate(
+            run.method,
+            validation,
+            classifiers,
+            config,
+            run.device,
+        )
+        record = {"step": step, "ratio": step / total_steps, **metrics}
+        records.append(record)
+        print(
+            f"{dataset} probe [{step}/{total_steps}] "
+            f"B={metrics['base_accuracy']:.4f} "
+            f"N={metrics['novel_accuracy']:.4f} "
+            f"H={metrics['harmonic_mean']:.4f}"
+        )
+        run.method.train()
+
+    probe(0)
+    run.method.train()
+    train_steps(
+        run.method.stage_one_logits,
+        run.parameters,
+        run.train_loader,
+        total_steps,
+        config,
+        run.device,
+        f"{dataset} optimized-breakpoint stage1",
+        probe,
+        gradient_gate=run.gradient_gate,
+    )
+
+    # max() keeps the first record when values tie because records are ordered.
+    selected = summarize_breakpoint_records(records)
+    result = build_breakpoint_result(
+        config,
+        dataset,
+        validation,
+        records,
+        selected,
+    )
+    result["breakpoint_name"] = "offline_validation_novel_peak"
+    result["gradient_gate"] = config.gradient_gate
+
+    device = run.device
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return result
 
 
 def comparison_signature(
@@ -380,7 +571,13 @@ def open_comparison_checkpoint(
     found_ratios: Mapping[str, float],
     restart: bool,
 ) -> tuple[Path, dict[str, Any]]:
-    path = artifact_path(config.datasets[0], config.peft, config.shots, "comparison")
+    path = artifact_path(
+        config.datasets[0],
+        config.peft,
+        config.shots,
+        "comparison",
+        config.gradient_gate,
+    )
     signature = comparison_signature(config, found_ratios)
     if path.is_file() and not restart:
         payload = load_json(path)

@@ -23,20 +23,27 @@ class AbsIdentityGate:
         self.first_moment = None
         self.second_square = None
 
-    def _flat_gradient(self, loss, retain_graph):
+    def _batched_gradients(self, losses, retain_graph):
+        count = losses.numel()
         gradients = torch.autograd.grad(
-            loss,
+            losses,
             self.parameters,
+            grad_outputs=torch.eye(count, device=losses.device, dtype=losses.dtype),
             retain_graph=retain_graph,
             allow_unused=True,
+            is_grads_batched=True,
         )
-        return torch.cat([
-            torch.zeros_like(parameter).flatten()
-            if gradient is None else gradient.flatten()
-            for gradient, parameter in zip(gradients, self.parameters)
-        ])
+        return torch.cat(
+            [
+                parameter.new_zeros((count, parameter.numel()))
+                if gradient is None
+                else gradient.detach().reshape(count, -1)
+                for gradient, parameter in zip(gradients, self.parameters)
+            ],
+            dim=1,
+        )
 
-    def initialize(self, logits_fn, dataset, device):
+    def initialize(self, logits_fn, dataset, device, amp_enabled=False):
         python_state = random.getstate()
         torch_state = torch.random.get_rng_state()
         cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
@@ -49,12 +56,18 @@ class AbsIdentityGate:
             samples = [dataset[index] for index in indices[start:start + 16]]
             images = torch.stack([sample[0] for sample in samples]).to(device)
             labels = torch.tensor([int(sample[1]) for sample in samples], device=device)
-            with torch.amp.autocast(device):
+            with torch.amp.autocast(torch.device(device).type, enabled=amp_enabled):
                 losses = F.cross_entropy(logits_fn(images), labels, reduction="none")
-            for index, loss in enumerate(losses):
-                gradient = self._flat_gradient(loss, retain_graph=index + 1 < len(losses)).detach()
-                first_sum = gradient.abs() if first_sum is None else first_sum + gradient.abs()
-                second_sum = gradient.square() if second_sum is None else second_sum + gradient.square()
+            for vjp_start in range(0, len(losses), self.online_images):
+                vjp_end = vjp_start + self.online_images
+                gradients = self._batched_gradients(
+                    losses[vjp_start:vjp_end],
+                    retain_graph=vjp_end < len(losses),
+                )
+                first = gradients.abs().sum(dim=0)
+                second = gradients.square().sum(dim=0)
+                first_sum = first if first_sum is None else first_sum + first
+                second_sum = second if second_sum is None else second_sum + second
 
         self.first_moment = first_sum / count
         self.second_square = second_sum / count
@@ -70,10 +83,7 @@ class AbsIdentityGate:
             ((step - 1) * self.online_images + index) % len(losses)
             for index in range(min(self.online_images, len(losses)))
         ]
-        gradients = torch.stack([
-            self._flat_gradient(losses[index], retain_graph=True).detach()
-            for index in selected
-        ])
+        gradients = self._batched_gradients(losses[selected], retain_graph=True)
         observed_first = gradients.abs().mean(dim=0)
         observed_second = gradients.square().mean(dim=0)
         self.first_moment.lerp_(observed_first, 1.0 - self.beta)

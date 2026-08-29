@@ -18,6 +18,8 @@ from datasets.transforms import build_transforms
 
 class Config(Protocol):
     repo_root: Path
+    data_root: Path
+    kaggle_root: Path
     shots: int
     datasets: tuple[str, ...]
 
@@ -34,22 +36,22 @@ class DatasetSpec:
 DATASET_SPECS = {
     "eurosat": DatasetSpec(
         "a centered satellite photo of {}.",
-        "data/eurosat/eurosat/2750",
-        "data/2sfs_splits/coop/split_zhou_EuroSAT.json",
+        "eurosat/eurosat/2750",
+        "2sfs_splits/coop/split_zhou_EuroSAT.json",
         "json",
         (4200, 3900),
     ),
     "fgvc_aircraft": DatasetSpec(
         "a photo of a {}, a type of aircraft.",
-        "data/fgvc_aircraft/fgvc-aircraft-2013b/data/images",
-        "data/fgvc_aircraft/fgvc-aircraft-2013b/data/images_variant_val.txt",
+        "fgvc_aircraft/fgvc-aircraft-2013b/data/images",
+        "fgvc_aircraft/fgvc-aircraft-2013b/data/images_variant_val.txt",
         "text",
         (1666, 1667),
     ),
     "dtd": DatasetSpec(
         "{} texture.",
-        "data/dtd/dtd/dtd/images",
-        "data/2sfs_splits/coop/split_zhou_DescribableTextures.json",
+        "dtd/dtd/dtd/images",
+        "2sfs_splits/coop/split_zhou_DescribableTextures.json",
         "json",
         (862, 828),  # Two Base images duplicate train images.
     ),
@@ -119,7 +121,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 def load_catalog(config: Config, dataset: str) -> tuple[ClassEntry, ...]:
     rows = [
         row
-        for row in read_csv(config.repo_root / "kaggle/public/classes.csv")
+        for row in read_csv(config.kaggle_root / "public/classes.csv")
         if row.get("dataset") == dataset
     ]
     catalog = tuple(
@@ -165,9 +167,9 @@ def load_train_dataset(
 ) -> ManifestDataset:
     catalog = _local_catalog(load_catalog(config, dataset), "base")
     by_key = {entry.key: entry for entry in catalog}
-    manifest = config.repo_root / f"kaggle/public/train_{config.shots}shot.csv"
+    manifest = config.kaggle_root / f"public/train_{config.shots}shot.csv"
     rows = [row for row in read_csv(manifest) if row.get("dataset") == dataset]
-    public_root = config.repo_root / "kaggle/public"
+    public_root = config.kaggle_root / "public"
     samples: list[ImageSample] = []
     counts: Counter[int] = Counter()
     for row in rows:
@@ -188,7 +190,7 @@ def load_train_dataset(
 
 
 def validation_manifest_path(config: Config, dataset: str) -> Path:
-    return config.repo_root / DATASET_SPECS[dataset].validation_manifest
+    return config.data_root / DATASET_SPECS[dataset].validation_manifest
 
 
 def _validation_samples(
@@ -196,7 +198,7 @@ def _validation_samples(
 ) -> list[tuple[Path, ClassEntry]]:
     spec = DATASET_SPECS[dataset]
     manifest = validation_manifest_path(config, dataset)
-    root = config.repo_root / spec.image_root
+    root = config.data_root / spec.image_root
     samples: list[tuple[Path, ClassEntry]] = []
     if spec.validation_format == "json":
         for relative, label, class_name in _read_json(manifest)["val"]:
@@ -256,13 +258,13 @@ def load_test_datasets_for_evaluation(
 ) -> tuple[ManifestDataset, ManifestDataset, dict[str, tuple[str, ...]]]:
     catalog = load_catalog(config, dataset)
     by_key = {entry.key: entry for entry in catalog}
-    public_root = config.repo_root / "kaggle/public"
+    public_root = config.kaggle_root / "public"
     test = [
         row for row in read_csv(public_root / "test.csv") if row["dataset"] == dataset
     ]
     solution = [
         row
-        for row in read_csv(config.repo_root / "kaggle/host_only/solution.csv")
+        for row in read_csv(config.kaggle_root / "host_only/solution.csv")
         if row["dataset"] == dataset
     ]
     truth = {row["id"]: row for row in solution}
@@ -295,7 +297,7 @@ def load_test_datasets_for_evaluation(
 
 
 def describe_breakpoint_inputs(config: Config) -> list[dict[str, Any]]:
-    train = read_csv(config.repo_root / f"kaggle/public/train_{config.shots}shot.csv")
+    train = read_csv(config.kaggle_root / f"public/train_{config.shots}shot.csv")
     summaries = []
     for dataset in config.datasets:
         catalog = load_catalog(config, dataset)

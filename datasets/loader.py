@@ -1,6 +1,7 @@
 from torch.utils.data import DataLoader
 
 from .fewshot import base2new_split, fewshot_subset
+from .kaggle import KAGGLE_DATASETS, get_kaggle_dataloader
 from .registry import DATASETS
 from .transforms import build_transforms
 
@@ -13,8 +14,16 @@ def get_dataloader(
     pretrained=False,
     model_name=None,
     shots=None,
-    setting="standard"
+    setting="standard",
+    kaggle_root="archive/03_kaggle_dataset_and_manifests",
+    device="cpu",
 ):
+    if method == "2sfs" and dataset_name in KAGGLE_DATASETS:
+        print(f"Using exact Kaggle split: {dataset_name}")
+        return get_kaggle_dataloader(
+            batch_size, dataset_name, root, kaggle_root, shots, device
+        )
+
     dataset = DATASETS[dataset_name]
     crop_size = 224 if pretrained else dataset.crop_size
     train_transform, test_transform = build_transforms(

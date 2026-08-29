@@ -11,6 +11,17 @@ from . import data, experiment
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+KAGGLE_ROOT = next(
+    (
+        path
+        for path in (
+            REPO_ROOT / "kaggle",
+            REPO_ROOT / "archive/03_kaggle_dataset_and_manifests",
+        )
+        if path.is_dir()
+    ),
+    REPO_ROOT / "kaggle",
+)
 FIXED_SUBMISSION_FILENAME = "submission_fixed_ratio_0.60.csv"
 FOUND_SUBMISSION_FILENAME = "submission_found_breakpoints.csv"
 
@@ -169,7 +180,7 @@ def export_model_submissions(peft: str = "ln", shots: int = 16) -> dict[str, Pat
         for name, result in payload["datasets"].items()
     }
 
-    public = REPO_ROOT / "kaggle/public"
+    public = KAGGLE_ROOT / "public"
     test_rows = data.read_csv(public / "test.csv")
     class_rows = data.read_csv(public / "classes.csv")
     test_ids = [row["id"] for row in test_rows]

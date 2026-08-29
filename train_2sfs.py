@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 
 from datasets import get_dataloader
+from datasets.kaggle import KAGGLE_DATASETS
 from datasets.vision.utils import GLOBAL_SEED
 from src.architecture import CLIP_MODEL, load_clip
 from src.methods import TwoStageCLIP
@@ -18,20 +19,23 @@ from src.peft import (
 )
 
 
+FIXED_STAGE_ONE_RATIOS = {"ln": 0.6, "lora": 0.3}
+
+
 def train_stage(
     logits_fn, parameters, loader, steps, lr, device, name, writer,
-    on_epoch_end=None, gradient_gate=None,
+    on_epoch_end=None, gradient_gate=None, amp=False,
 ):
     optimizer = torch.optim.AdamW(parameters, lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps, eta_min=1e-6)
-    scaler = torch.amp.GradScaler()
+    scaler = torch.amp.GradScaler(device, enabled=amp)
     cur_step = 0
 
     while cur_step < steps:
         for batch_index, (images, labels) in enumerate(loader, 1):
             optimizer.zero_grad()
             images, labels = images.to(device), labels.to(device)
-            with torch.amp.autocast(device):
+            with torch.amp.autocast(device, enabled=amp):
                 losses = F.cross_entropy(
                     logits_fn(images), labels,
                     reduction="none" if gradient_gate else "mean",
@@ -118,13 +122,11 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         mark_only_layernorm_as_trainable(method.model)
 
     parameters = [parameter for parameter in method.model.parameters() if parameter.requires_grad]
-    if not parameters:
-        raise RuntimeError(f"No trainable parameters found after applying PEFT mode: {args.peft}")
 
     gradient_gate = None
     if args.gradient_gate == "abs_identity":
         gradient_gate = AbsIdentityGate(parameters)
-        gradient_gate.initialize(method.stage_one_logits, train_loader.dataset, device)
+        gradient_gate.initialize(method.stage_one_logits, train_loader.dataset, device, args.amp)
 
     on_epoch_end = None
     if args.setting == "base2new":
@@ -172,7 +174,8 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         "stage1",
         writer,
         on_epoch_end,
-        gradient_gate
+        gradient_gate,
+        args.amp,
     )
 
     method.initialize_classifier()
@@ -185,7 +188,8 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         args.lr,
         device,
         "stage2",
-        writer
+        writer,
+        amp=args.amp,
     )
 
     method.eval()
@@ -205,33 +209,46 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         evaluate(method, test_loader, method.classifier, device, "test")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
+def build_parser(description=None):
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--dataset", default="cifar10")
     parser.add_argument("--shots", type=int, choices=[1, 2, 4, 8, 16], default=1)
     parser.add_argument("--peft", choices=["ln", "lora"], default="ln")
     parser.add_argument("--gradient_gate", choices=["none", "abs_identity"], default="none")
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--steps_per_shot", type=int, default=300)
-    parser.add_argument("--stage_one_ratio", type=float, default=0.6)
+    parser.add_argument("--bp_mode", choices=("fixed", "manual", "ema_loss"))
+    parser.add_argument("--stage_one_ratio", type=float)
     parser.add_argument("--setting", choices=["standard", "base2new"], default="standard")
     parser.add_argument("--data_root", default="data")
-    return parser.parse_args()
+    parser.add_argument("--kaggle-root", default="archive/03_kaggle_dataset_and_manifests")
+    return parser
+
+
+def parse_args(argv=None):
+    return build_parser().parse_args(argv)
 
 
 def main():
     args = parse_args()
+    if args.bp_mode != "manual":
+        args.stage_one_ratio = FIXED_STAGE_ONE_RATIOS[args.peft]
     torch.manual_seed(GLOBAL_SEED)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    if args.dataset in KAGGLE_DATASETS:
+        args.setting = "base2new"
     train_loader, validation_loader, test_loader, _ = get_dataloader(
         args.batch_size,
         args.dataset,
         "2sfs",
         root=args.data_root,
         shots=args.shots,
-        setting=args.setting
+        setting=args.setting,
+        kaggle_root=args.kaggle_root,
+        device=device,
     )
     model, tokenizer = load_clip(CLIP_MODEL)
     method = TwoStageCLIP(
@@ -240,7 +257,10 @@ def main():
         train_loader.dataset.classes,
         train_loader.dataset.template
     )
-    run_name = f"{args.dataset}-{args.peft}-{args.shots}shot-ratio{args.stage_one_ratio}"
+    run_name = (
+        f"{args.dataset}-{args.peft}-{args.shots}shot-"
+        f"bp{args.bp_mode}-ratio{args.stage_one_ratio}"
+    )
     if args.gradient_gate != "none":
         run_name += f"-{args.gradient_gate}"
     if args.setting == "base2new":

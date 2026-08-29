@@ -48,15 +48,33 @@ chmod +x tensorboard.sh
 ./tensorboard.sh
 ```
 
-Kaggle 3종 데이터셋의 breakpoint 탐색과 논문의 LayerNorm 고정 비율 비교는
-`notebook/01_find_breakpoints.ipynb`, `notebook/02_compare_breakpoint_ratios.ipynb`에서
-순서대로 따라 할 수 있습니다. 두 노트북은 실험 원리, 입력 점검, 단일 GPU 순차 실행,
-결과 해석을 단계별로 설명합니다. 핵심 breakpoint 탐색과 2-stage 비교 함수는
-노트북에 직접 제시하고, manifest 로딩은 `notebook/utils/data.py`, 공통 학습·평가와
-checkpoint는 `notebook/utils/experiment.py`, 결과 요약과 submission 생성은
-`notebook/utils/results.py`에서 호출합니다. 모델은 기존 `src/methods/twostage.py`의
-`TwoStageCLIP`을 그대로 사용합니다.
-완료된 실험 요약과 breakpoint 차트는 `results/report/README.md`에 있습니다.
+Kaggle 3종 데이터셋의 optimized breakpoint는 다음처럼 탐색합니다.
+
+```bash
+uv run python notebook/find_optimized_breakpoint.py \
+  --dataset eurosat \
+  --shots 16 \
+  --peft ln \
+  --gradient_gate abs_identity
+```
+
+스크립트는 exact Kaggle Base/Novel split의 전체 validation Novel accuracy가 최초로
+최대가 되는 step을 기본 breakpoint로 저장합니다. Base, Novel, HM의 모든 probe 기록은
+JSON에 남기고 같은 위치에 논문형 trajectory PNG도 생성합니다. 현재 Dynamic Gate의
+AMP는 기본적으로 꺼져 있습니다. 현재 Dynamic Gate의 AMP overflow 처리는 보완
+전이므로 재현성을 우선하는 실험에서는 `--amp`를 추가하지 않습니다.
+`notebook/01_find_breakpoints.ipynb`와
+`notebook/02_compare_breakpoint_ratios.ipynb`는 기존 실험 흐름과 fixed-ratio 비교를
+설명하는 참고 노트북입니다. Manifest 로딩은 `notebook/utils/data.py`, 공통 학습·평가는
+`notebook/utils/experiment.py`를 재사용합니다.
+
+저장된 JSON에서 figure를 다시 만들거나 수동 선택선을 추가할 수도 있습니다.
+
+```bash
+uv run python notebook/utils/breakpoint_plot.py \
+  archive/05_optimized_breakpoint_experiments/optimized_breakpoint_eurosat_ln_abs_identity_16shot.json \
+  --manual-step 1200
+```
 
 ## Methods
 
