@@ -60,7 +60,6 @@ class TwoStageCLIP(nn.Module):
     def stage_two_logits(self, images):
         return self.classifier_logits(images, self.classifier)
 
-    # 추가: 다양한 손실 함수(KgCoOp 등)를 지원하기 위한 공통 인터페이스
     def compute_loss(self, images, labels, stage):
         if stage == "stage1":
             logits = self.stage_one_logits(images)

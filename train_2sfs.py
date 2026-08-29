@@ -9,9 +9,8 @@ from torch.utils.tensorboard import SummaryWriter
 from architecture import CLIP_MODEL, load_clip
 from datasets import get_dataloader
 from datasets.vision.utils import GLOBAL_SEED
-from methods import TwoStageCLIP
+from methods.twostage import TwoStageCLIP
 from peft import apply_lora, mark_only_layernorm_as_trainable, mark_only_lora_as_trainable
-
 
 def train_stage(method, parameters, loader, steps, lr, device, name, writer, on_epoch_end=None):
     optimizer = torch.optim.AdamW(parameters, lr=lr)
@@ -24,7 +23,6 @@ def train_stage(method, parameters, loader, steps, lr, device, name, writer, on_
             optimizer.zero_grad()
             images, labels = images.to(device), labels.to(device)
             with torch.amp.autocast(device):
-                # 수정: 단일 CrossEntropy 대신 method의 compute_loss 호출
                 loss, logits = method.compute_loss(images, labels, stage=name)
 
             scale = scaler.get_scale()
@@ -43,7 +41,6 @@ def train_stage(method, parameters, loader, steps, lr, device, name, writer, on_
         if on_epoch_end and batch_index == len(loader):
             on_epoch_end(cur_step)
 
-
 def evaluate(method, loader, classifier, device, split):
     total_loss, total_correct, total_size = 0, 0, 0
 
@@ -60,7 +57,6 @@ def evaluate(method, loader, classifier, device, split):
     accuracy = total_correct / total_size
     print(f"{split.title()} - Accuracy: {accuracy * 100:.1f}%, Avg loss: {loss:.6f}")
     return accuracy
-
 
 def build_breakpoint_loader(method, loader, classifier, device, split):
     incorrect_by_class = {label: [] for label in range(len(loader.dataset.classes))}
@@ -86,35 +82,49 @@ def build_breakpoint_loader(method, loader, classifier, device, split):
     print(f"{split.title()} full - Accuracy: {total_correct / total_size * 100:.1f}%, Breakpoint samples: {len(dataset)}")
     return DataLoader(dataset, batch_size=loader.batch_size)
 
-
 def train_2sfs(args, method, train_loader, validation_loader, test_loader, device, writer):
     total_steps = args.shots * args.steps_per_shot
     stage_one_steps = int(total_steps * args.stage_one_ratio)
     method.to(device)
 
-    # 파라미터 분기 처리 수정
-    if args.peft == "lora":
+    # 통합된 PEFT 적용
+    peft_methods = args.peft.split('+')
+    
+    method.model.requires_grad_(False)
+    if hasattr(method, 'prompt_learner'):
+        method.prompt_learner.requires_grad_(False)
+        
+    if 'lora' in peft_methods:
         apply_lora(method.model.vision_model)
         apply_lora(method.model.text_model)
-        parameters = mark_only_lora_as_trainable(method.model)
-    elif args.peft == "kgcoop":
-        # KgCoOp의 경우 백본 고정 & 프롬프트 파라미터만 학습
-        for param in method.model.parameters():
-            param.requires_grad_(False)
-        parameters = list(method.prompt_learner.parameters())
-    else:
-        parameters = mark_only_layernorm_as_trainable(method.model)
+        
+    if 'ln' in peft_methods:
+        for encoder in (method.model.vision_model, method.model.text_model):
+            for module in encoder.modules():
+                if isinstance(module, torch.nn.LayerNorm):
+                    module.requires_grad_(True)
+                    
+    if 'lora' in peft_methods:
+        for name, param in method.model.named_parameters():
+            if "lora_a." in name or "lora_b." in name:
+                param.requires_grad_(True)
+                
+    if 'kgcoop' in peft_methods:
+        method.prompt_learner.requires_grad_(True)
+        
+    parameters = [p for p in method.parameters() if p.requires_grad]
 
     on_epoch_end = None
     if args.setting == "base2new":
         validation_base_loader, validation_new_loader = validation_loader
         method.eval()
         with torch.no_grad():
-            if args.peft == "kgcoop":
+            if 'kgcoop' in peft_methods:
                 base_classifier = method.encode_learned_text()
             else:
                 base_classifier = method.encode_text()
             new_classifier = method.encode_classnames(validation_new_loader.dataset.classes)
+            
         breakpoint_base_loader = build_breakpoint_loader(method, validation_base_loader, base_classifier, device, "stage1 [0] base")
         breakpoint_new_loader = build_breakpoint_loader(method, validation_new_loader, new_classifier, device, "stage1 [0] new")
         previous_step = previous_base_accuracy = previous_new_accuracy = 0
@@ -125,7 +135,7 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
             nonlocal previous_step, previous_base_accuracy, previous_new_accuracy
             method.eval()
             with torch.no_grad():
-                if args.peft == "kgcoop":
+                if 'kgcoop' in peft_methods:
                     base_classifier = method.encode_learned_text()
                 else:
                     base_classifier = method.encode_text()
@@ -148,7 +158,7 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
 
     method.train()
     train_stage(
-        method, # logits_fn 대신 method 객체 자체를 전달
+        method,
         parameters,
         train_loader,
         stage_one_steps,
@@ -162,7 +172,7 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
     method.initialize_classifier()
     method.eval()
     train_stage(
-        method, # logits_fn 대신 method 전달
+        method,
         [method.classifier],
         train_loader,
         total_steps - stage_one_steps,
@@ -188,22 +198,22 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         evaluate(method, validation_loader, method.classifier, device, "validation")
         evaluate(method, test_loader, method.classifier, device, "test")
 
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="cifar10")
     parser.add_argument("--shots", type=int, choices=[1, 2, 4, 8, 16], default=1)
-    parser.add_argument("--peft", choices=["ln", "lora", "kgcoop"], default="ln") # kgcoop 추가
-    parser.add_argument("--n_ctx", type=int, default=8, help="KgCoOp context length") # n_ctx 추가
-    parser.add_argument("--w", type=float, default=8.0, help="KgCoOp discrepancy loss weight") # w 추가
+    parser.add_argument("--peft", type=str, default="ln", help="PEFT methods to use, separated by '+' (e.g., kgcoop+lora)")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--steps_per_shot", type=int, default=300)
     parser.add_argument("--stage_one_ratio", type=float, default=0.6)
     parser.add_argument("--setting", choices=["standard", "base2new"], default="standard")
     parser.add_argument("--data_root", default="data")
-    return parser.parse_args()
 
+    #kgcoop
+    parser.add_argument("--n_ctx", type=int, default=8, help="KgCoOp context length")
+    parser.add_argument("--w", type=float, default=8.0, help="KgCoOp discrepancy loss weight")
+    return parser.parse_args()
 
 def main():
     args = parse_args()
@@ -220,8 +230,9 @@ def main():
     )
     model, tokenizer = load_clip(CLIP_MODEL)
     
-    # PEFT 종류에 따라 메서드 초기화
-    if args.peft == "kgcoop":
+    peft_methods = args.peft.split('+')
+    
+    if "kgcoop" in peft_methods:
         from peft.kgcoop import TwoStageKgCoOp
         method = TwoStageKgCoOp(
             model,
@@ -252,7 +263,6 @@ def main():
             device,
             writer
         )
-
 
 if __name__ == "__main__":
     main()
