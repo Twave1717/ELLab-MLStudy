@@ -168,17 +168,76 @@ Text encoder가 고정되어 있으므로 class prompt embedding은 모델 생�
 
 ### LoRA
 
-LoRA는 vision encoder 모든 Transformer layer의 `q_proj`, `k_proj`,
-`v_proj`에만 적용합니다.
+`train.py --method clip --peft lora`는 vision encoder에만 LoRA를 적용합니다.
+`train_2sfs.py --peft lora`는 vision encoder와 text encoder 모두에 적용합니다.
+
+기본 설정은 두 경로 모두 같습니다.
 
 ```text
-rank = 2
-alpha = 1
+target  = q_proj, k_proj, v_proj
+rank    = 2
+alpha   = 1
 dropout = 0.25
 ```
 
 이 값은 `rethinking_fewshot_vlms`의 기본 설정을 사용합니다. LoRA 실행 시
 기존 CLIP parameter는 모두 고정되고 LoRA parameter만 학습합니다.
+
+scaling은 `alpha / sqrt(rank)`입니다. 널리 쓰이는 `alpha / rank`가 아니므로
+rank를 바꾸면 유효 학습률이 `1 / sqrt(rank)`에 비례해 변한다는 점에 유의하세요.
+
+기본 설정의 trainable parameter 수는 다음과 같습니다.
+
+| 설정 | LoRA module | tensor | trainable parameter |
+| --- | ---: | ---: | ---: |
+| `--peft lora` (q k v, rank 2, vision+text) | 72 | 144 | 184,320 |
+| `--peft ln` | - | 102 | 65,536 |
+
+`--peft ln`은 block 안의 `layer_norm1`, `layer_norm2`뿐 아니라
+`pre_layrnorm`, `post_layernorm`, `final_layer_norm`도 함께 학습합니다.
+
+### 2SFS LoRA 옵션
+
+`train_2sfs.py`는 LoRA 배치와 Stage 1 optimizer를 CLI로 조정할 수 있습니다.
+모든 옵션의 기본값은 위 기본 설정과 같으므로, 지정하지 않으면 동작이 바뀌지 않습니다.
+
+| Option | 기본값 | 설명 |
+| --- | --- | --- |
+| `--lora_targets` | `q k v` | `q k v o fc1 fc2` 중 선택. 별칭 `out_proj`, `c_fc`, `c_proj` 허용 |
+| `--lora_rank` | `2` | LoRA rank |
+| `--lora_alpha` | `1.0` | `scaling = alpha / sqrt(rank)` |
+| `--lora_dropout` | `0.25` | LoRA 입력 dropout |
+| `--lora_blocks` | `all` | `all`, `odd`, `even` 또는 0-based index 목록 (`0,2,4`) |
+| `--lora_modality` | `both` | `both`, `vision`, `text` |
+| `--stage1_optimizer` | `adamw` | `adamw` 또는 `lora_pro` |
+| `--lora_pro_lr` | `2e-6` | `lora_pro`의 Stage 1 학습률 |
+| `--stage1_eta_min` | 자동 | cosine 하한. `adamw`는 `1e-6`, `lora_pro`는 `lr / 100` |
+| `--weight_decay` | `1e-2` | AdamW weight decay |
+
+```bash
+# attention output projection까지 확장
+uv run python train_2sfs.py --dataset cifar10 --shots 1 --peft lora \
+  --lora_targets q k v o
+
+# 홀수 block에만 rank 1 LoRA
+uv run python train_2sfs.py --dataset cifar10 --shots 1 --peft lora \
+  --lora_targets q k v --lora_rank 1 --lora_blocks odd
+
+# Stage 1을 LoRA-Pro로 학습
+uv run python train_2sfs.py --dataset cifar10 --shots 1 --peft lora \
+  --stage1_optimizer lora_pro --lora_pro_lr 2e-6
+```
+
+기본값과 다른 설정은 `runs/2sfs/` 디렉터리 이름에 접미사로 붙어 실행끼리 섞이지
+않습니다. Stage 2는 classifier만 학습하므로 항상 AdamW를 사용합니다.
+
+```text
+runs/2sfs/cifar10-lora-1shot-ratio0.6-lora_rank1-lora_blocksodd
+```
+
+LoRA-Pro는 Adam moment를 A/B가 아니라 등가 full matrix `(out, in)` 두 개로
+유지합니다. 기본 target(q k v, 12 block, vision+text)에서 optimizer state만
+약 234 MiB가 추가로 필요하며, `fc1`/`fc2`를 포함하면 더 커집니다.
 
 ## Datasets
 
