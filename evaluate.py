@@ -3,12 +3,12 @@ import argparse
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-import architecture
-from architecture.rotnet import RotNet
 from datasets import get_dataloader
 from datasets.vision.utils import GLOBAL_SEED
-from eval import RotNetNonLinearEval
-from methods.clip import CLIP
+from src import architecture
+from src.architecture.rotnet import RotNet
+from src.eval import RotNetNonLinearEval
+from src.methods.clip import CLIP
 from train import train
 
 

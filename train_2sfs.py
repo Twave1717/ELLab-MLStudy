@@ -6,11 +6,16 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 
-from architecture import CLIP_MODEL, load_clip
 from datasets import get_dataloader
 from datasets.vision.utils import GLOBAL_SEED
-from methods import TwoStageCLIP
-from peft import AbsIdentityGate, apply_lora, mark_only_layernorm_as_trainable, mark_only_lora_as_trainable
+from src.architecture import CLIP_MODEL, load_clip
+from src.methods import TwoStageCLIP
+from src.peft import (
+    AbsIdentityGate,
+    apply_lora,
+    mark_only_layernorm_as_trainable,
+    mark_only_lora_as_trainable,
+)
 
 
 def train_stage(
