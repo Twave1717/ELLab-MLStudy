@@ -5,3 +5,4 @@ from .lora import (
     mark_only_lora_as_trainable
 )
 from .layernorm import mark_only_layernorm_as_trainable
+from .abs_identity import AbsIdentityGate
