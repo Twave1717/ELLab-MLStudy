@@ -10,10 +10,13 @@ from architecture import CLIP_MODEL, load_clip
 from datasets import get_dataloader
 from datasets.vision.utils import GLOBAL_SEED
 from methods import TwoStageCLIP
-from peft import apply_lora, mark_only_layernorm_as_trainable, mark_only_lora_as_trainable
+from peft import AbsIdentityGate, apply_lora, mark_only_layernorm_as_trainable, mark_only_lora_as_trainable
 
 
-def train_stage(logits_fn, parameters, loader, steps, lr, device, name, writer, on_epoch_end=None):
+def train_stage(
+    logits_fn, parameters, loader, steps, lr, device, name, writer,
+    on_epoch_end=None, gradient_gate=None,
+):
     optimizer = torch.optim.AdamW(parameters, lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps, eta_min=1e-6)
     scaler = torch.amp.GradScaler()
@@ -24,7 +27,15 @@ def train_stage(logits_fn, parameters, loader, steps, lr, device, name, writer, 
             optimizer.zero_grad()
             images, labels = images.to(device), labels.to(device)
             with torch.amp.autocast(device):
-                loss = F.cross_entropy(logits_fn(images), labels)
+                losses = F.cross_entropy(
+                    logits_fn(images), labels,
+                    reduction="none" if gradient_gate else "mean",
+                )
+                loss = losses.mean() if gradient_gate else losses
+
+            previous = q = None
+            if gradient_gate:
+                previous, q = gradient_gate.prepare(losses, cur_step + 1)
 
             scale = scaler.get_scale()
             scaler.scale(loss).backward()
@@ -32,6 +43,9 @@ def train_stage(logits_fn, parameters, loader, steps, lr, device, name, writer, 
             scaler.update()
             if scaler.get_scale() < scale:
                 continue
+            if gradient_gate:
+                gradient_gate.apply(previous, q)
+                writer.add_scalar(f"Q/{name}", q.mean().item(), cur_step + 1)
 
             scheduler.step()
             cur_step += 1
@@ -94,9 +108,18 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
     if args.peft == "lora":
         apply_lora(method.model.vision_model)
         apply_lora(method.model.text_model)
-        parameters = mark_only_lora_as_trainable(method.model)
+        mark_only_lora_as_trainable(method.model)
     else:
-        parameters = mark_only_layernorm_as_trainable(method.model)
+        mark_only_layernorm_as_trainable(method.model)
+
+    parameters = [parameter for parameter in method.model.parameters() if parameter.requires_grad]
+    if not parameters:
+        raise RuntimeError(f"No trainable parameters found after applying PEFT mode: {args.peft}")
+
+    gradient_gate = None
+    if args.gradient_gate == "abs_identity":
+        gradient_gate = AbsIdentityGate(parameters)
+        gradient_gate.initialize(method.stage_one_logits, train_loader.dataset, device)
 
     on_epoch_end = None
     if args.setting == "base2new":
@@ -143,7 +166,8 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         device,
         "stage1",
         writer,
-        on_epoch_end
+        on_epoch_end,
+        gradient_gate
     )
 
     method.initialize_classifier()
@@ -181,6 +205,7 @@ def parse_args():
     parser.add_argument("--dataset", default="cifar10")
     parser.add_argument("--shots", type=int, choices=[1, 2, 4, 8, 16], default=1)
     parser.add_argument("--peft", choices=["ln", "lora"], default="ln")
+    parser.add_argument("--gradient_gate", choices=["none", "abs_identity"], default="none")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--steps_per_shot", type=int, default=300)
@@ -211,6 +236,8 @@ def main():
         train_loader.dataset.template
     )
     run_name = f"{args.dataset}-{args.peft}-{args.shots}shot-ratio{args.stage_one_ratio}"
+    if args.gradient_gate != "none":
+        run_name += f"-{args.gradient_gate}"
     if args.setting == "base2new":
         run_name += "-base2new"
     with SummaryWriter(f"runs/2sfs/{run_name}") as writer:
