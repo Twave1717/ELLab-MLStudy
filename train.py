@@ -5,11 +5,10 @@ from datetime import datetime
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-import architecture
-import methods
 from datasets import get_dataloader
 from datasets.vision.utils import GLOBAL_SEED
-from peft import apply_lora, lora_state_dict, mark_only_lora_as_trainable
+from src import architecture, methods
+from src.peft import apply_lora, lora_state_dict, mark_only_lora_as_trainable
 
 
 def train(

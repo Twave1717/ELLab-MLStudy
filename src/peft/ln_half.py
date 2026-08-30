@@ -1,8 +1,8 @@
 from torch import nn
 
+
 def mark_only_half_layernorm_as_trainable(clip_model):
     clip_model.requires_grad_(False)
-
 
     for encoder in (clip_model.vision_model, clip_model.text_model):
         idx = 0
