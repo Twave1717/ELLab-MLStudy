@@ -6,16 +6,24 @@ from torch import nn
 RANK = 2
 ALPHA = 1
 DROPOUT = 0.25
+TARGETS = ("q", "k", "v", "o", "fc1", "fc2")
+
+_ATTENTION_TARGETS = {
+    "q": "q_proj",
+    "k": "k_proj",
+    "v": "v_proj",
+    "o": "out_proj",
+}
 
 
 class LoRALinear(nn.Module):
-    def __init__(self, base):
+    def __init__(self, base, rank=RANK):
         super().__init__()
         self.base = base
-        self.scaling = ALPHA / math.sqrt(RANK)
+        self.scaling = ALPHA / math.sqrt(rank)
         self.dropout = nn.Dropout(DROPOUT)
-        self.lora_a = nn.Linear(base.in_features, RANK, bias=False)
-        self.lora_b = nn.Linear(RANK, base.out_features, bias=False)
+        self.lora_a = nn.Linear(base.in_features, rank, bias=False)
+        self.lora_b = nn.Linear(rank, base.out_features, bias=False)
         self.to(base.weight)
         nn.init.zeros_(self.lora_b.weight)
 
@@ -25,17 +33,39 @@ class LoRALinear(nn.Module):
         )
 
 
-def apply_lora(encoder):
+def apply_lora(encoder, targets=("q", "k", "v"), blocks="all", rank=RANK):
+    layers = encoder.encoder.layers
+    indices = {
+        "all": range(len(layers)),
+        "odd": range(1, len(layers), 2),
+        "even": range(0, len(layers), 2),
+    }[blocks]
     replaced = 0
 
-    for layer in encoder.encoder.layers:
-        attention = layer.self_attn
-        for name in ("q_proj", "k_proj", "v_proj"):
-            projection = getattr(attention, name)
-            setattr(attention, name, LoRALinear(projection))
+    for index in indices:
+        layer = layers[index]
+        for target in targets:
+            parent = layer.self_attn if target in _ATTENTION_TARGETS else layer.mlp
+            name = _ATTENTION_TARGETS.get(target, target)
+            setattr(parent, name, LoRALinear(getattr(parent, name), rank))
             replaced += 1
 
     return replaced
+
+
+def apply_lora_to_clip(
+    model,
+    targets=("q", "k", "v"),
+    blocks="all",
+    modality="both",
+    rank=RANK,
+):
+    encoders = []
+    if modality in {"both", "vision"}:
+        encoders.append(model.vision_model)
+    if modality in {"both", "text"}:
+        encoders.append(model.text_model)
+    return sum(apply_lora(encoder, targets, blocks, rank) for encoder in encoders)
 
 
 def mark_only_lora_as_trainable(model):
@@ -45,6 +75,14 @@ def mark_only_lora_as_trainable(model):
             module.lora_a.requires_grad_(True)
             module.lora_b.requires_grad_(True)
     return [parameter for parameter in model.parameters() if parameter.requires_grad]
+
+
+def lora_modules(model):
+    return {
+        name: module
+        for name, module in model.named_modules()
+        if isinstance(module, LoRALinear)
+    }
 
 
 def lora_state_dict(model):
