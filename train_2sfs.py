@@ -14,6 +14,7 @@ from src.peft import (
     AbsIdentityGate,
     LoRAProOptimizer,
     lora,
+    mark_only_half_layernorm_as_trainable,
     mark_only_layernorm_as_trainable,
 )
 
@@ -21,6 +22,7 @@ from src.peft import (
 def train_stage(
     logits_fn, parameters, loader, steps, lr, device, name, writer,
     on_epoch_end=None, gradient_gate=None, optimizer=None, eta_min=1e-6,
+    early_stop=False,
 ):
     if optimizer is None:
         optimizer = torch.optim.AdamW(parameters, lr=lr)
@@ -29,6 +31,10 @@ def train_stage(
     )
     scaler = torch.amp.GradScaler()
     cur_step = 0
+    beta = 0.98
+    loss_ema = None
+    loss_best = float('inf')
+    loss_bad = 0
 
     while cur_step < steps:
         for batch_index, (images, labels) in enumerate(loader, 1):
@@ -57,12 +63,28 @@ def train_stage(
 
             scheduler.step()
             cur_step += 1
+
             print(f"{name} [{cur_step}/{steps}] Loss: {loss.item():.4f}")
             writer.add_scalar(f"Loss/{name}", loss.item(), cur_step)
+
+            if early_stop:
+                loss_ema = loss.item() if loss_ema is None else beta * loss_ema + (1-beta) * loss.item()
+                if cur_step > steps * 0.2:
+                    if loss_ema < loss_best - 1e-4:
+                        loss_best = loss_ema
+                        loss_bad = 0
+                    else:
+                        loss_bad += 1
+                    loss_ok = loss_bad >= 60  # LOSS_PATIENCE
+                    if loss_ok:
+                        return cur_step
+
             if cur_step == steps:
                 break
         if on_epoch_end and batch_index == len(loader):
             on_epoch_end(cur_step)
+
+    return cur_step
 
 
 def evaluate(method, loader, classifier, device, split):
@@ -122,6 +144,8 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
             rank=args.lora_rank,
         )
         lora.mark_only_lora_as_trainable(method.model)
+    elif args.peft == "ln_half":
+        mark_only_half_layernorm_as_trainable(method.model)
     else:
         mark_only_layernorm_as_trainable(method.model)
 
@@ -177,7 +201,7 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
             lora.lora_modules(method.model), args.lora_pro_lr
         )
         stage_one_eta_min = args.lora_pro_lr / 100
-    train_stage(
+    stage_one_steps_run = train_stage(
         method.stage_one_logits,
         parameters,
         train_loader,
@@ -190,15 +214,16 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         gradient_gate,
         optimizer=stage_one_optimizer,
         eta_min=stage_one_eta_min,
+        early_stop=args.ema_early_stop,
     )
 
     method.initialize_classifier()
     method.eval()
-    train_stage(
+    stage_two_steps_run = train_stage(
         method.stage_two_logits,
         [method.classifier],
         train_loader,
-        total_steps - stage_one_steps,
+        total_steps - stage_one_steps_run,
         args.lr,
         device,
         "stage2",
@@ -226,7 +251,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="cifar10")
     parser.add_argument("--shots", type=int, choices=[1, 2, 4, 8, 16], default=1)
-    parser.add_argument("--peft", choices=["ln", "lora"], default="ln")
+    parser.add_argument("--peft", choices=["ln", "lora", "ln_half"], default="ln")
     parser.add_argument("--gradient_gate", choices=["none", "abs_identity"], default="none")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-4)
@@ -234,6 +259,7 @@ def parse_args():
     parser.add_argument("--stage_one_ratio", type=float, default=0.6)
     parser.add_argument("--setting", choices=["standard", "base2new"], default="standard")
     parser.add_argument("--data_root", default="data")
+    parser.add_argument("--ema_early_stop", action="store_true")
     parser.add_argument("--lora_targets", nargs="+", choices=lora.TARGETS, default=["q", "k", "v"])
     parser.add_argument("--lora_blocks", choices=["all", "odd", "even"], default="all")
     parser.add_argument("--lora_modality", choices=["both", "vision", "text"], default="both")
