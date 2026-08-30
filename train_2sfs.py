@@ -12,13 +12,9 @@ from src.architecture import CLIP_MODEL, load_clip
 from src.methods import TwoStageCLIP
 from src.peft import (
     AbsIdentityGate,
-    RANK,
-    TARGETS,
     LoRAProOptimizer,
-    apply_lora_to_clip,
-    lora_modules,
+    lora,
     mark_only_layernorm_as_trainable,
-    mark_only_lora_as_trainable,
 )
 
 
@@ -118,14 +114,14 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
     method.to(device)
 
     if args.peft == "lora":
-        apply_lora_to_clip(
+        lora.apply_lora_to_clip(
             method.model,
             targets=args.lora_targets,
             blocks=args.lora_blocks,
             modality=args.lora_modality,
             rank=args.lora_rank,
         )
-        mark_only_lora_as_trainable(method.model)
+        lora.mark_only_lora_as_trainable(method.model)
     else:
         mark_only_layernorm_as_trainable(method.model)
 
@@ -178,7 +174,7 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
     stage_one_eta_min = 1e-6
     if args.peft == "lora" and args.stage1_optimizer == "lora_pro":
         stage_one_optimizer = LoRAProOptimizer(
-            lora_modules(method.model), args.lora_pro_lr
+            lora.lora_modules(method.model), args.lora_pro_lr
         )
         stage_one_eta_min = args.lora_pro_lr / 100
     train_stage(
@@ -238,19 +234,11 @@ def parse_args():
     parser.add_argument("--stage_one_ratio", type=float, default=0.6)
     parser.add_argument("--setting", choices=["standard", "base2new"], default="standard")
     parser.add_argument("--data_root", default="data")
-    parser.add_argument(
-        "--lora_targets", nargs="+", choices=TARGETS, default=["q", "k", "v"]
-    )
-    parser.add_argument(
-        "--lora_blocks", choices=["all", "odd", "even"], default="all"
-    )
-    parser.add_argument(
-        "--lora_modality", choices=["both", "vision", "text"], default="both"
-    )
-    parser.add_argument("--lora_rank", type=int, default=RANK)
-    parser.add_argument(
-        "--stage1_optimizer", choices=["adamw", "lora_pro"], default="adamw"
-    )
+    parser.add_argument("--lora_targets", nargs="+", choices=lora.TARGETS, default=["q", "k", "v"])
+    parser.add_argument("--lora_blocks", choices=["all", "odd", "even"], default="all")
+    parser.add_argument("--lora_modality", choices=["both", "vision", "text"], default="both")
+    parser.add_argument("--lora_rank", type=int, default=lora.RANK)
+    parser.add_argument("--stage1_optimizer", choices=["adamw", "lora_pro"], default="adamw")
     parser.add_argument("--lora_pro_lr", type=float, default=2e-6)
     args = parser.parse_args()
     if args.stage1_optimizer == "lora_pro" and args.peft != "lora":
@@ -287,7 +275,7 @@ def main():
         args.lora_targets != ["q", "k", "v"]
         or args.lora_blocks != "all"
         or args.lora_modality != "both"
-        or args.lora_rank != RANK
+        or args.lora_rank != lora.RANK
         or args.stage1_optimizer != "adamw"
     ):
         targets = "".join(args.lora_targets)

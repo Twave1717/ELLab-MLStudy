@@ -1,6 +1,4 @@
 from .lora import (
-    RANK,
-    TARGETS,
     LoRALinear,
     apply_lora,
     apply_lora_to_clip,
