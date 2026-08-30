@@ -13,16 +13,15 @@ from methods import TwoStageCLIP
 from peft import apply_lora, mark_only_layernorm_as_trainable, mark_only_lora_as_trainable, mark_only_half_layernorm_as_trainable
 
 
-def train_stage(args, logits_fn, parameters, loader, steps, lr, device, name, writer, on_epoch_end=None):
+def train_stage(logits_fn, parameters, loader, steps, lr, device, name, writer, on_epoch_end=None, early_stop=False):
     optimizer = torch.optim.AdamW(parameters, lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps, eta_min=1e-6)
     scaler = torch.amp.GradScaler()
     cur_step = 0
     beta = 0.98
-
-    args.loss_ema = None; args.prev_loss_ema = None
-    args.loss_best = float('inf'); args.loss_bad = 0
-    args.stopped = False
+    loss_ema = None
+    loss_best = float('inf')
+    loss_bad = 0
 
     while cur_step < steps:
         for batch_index, (images, labels) in enumerate(loader, 1):
@@ -41,33 +40,27 @@ def train_stage(args, logits_fn, parameters, loader, steps, lr, device, name, wr
             scheduler.step()
             cur_step += 1
 
-            args.loss_ema = loss.item() if args.loss_ema is None else beta * args.loss_ema + (1-beta) * loss.item()
-
-            if cur_step > steps * 0.2:
-                if args.loss_ema < args.loss_best - 1e-4:
-                    args.loss_best = args.loss_ema
-                    args.loss_bad = 0
-                else:
-                    args.loss_bad += 1
-                loss_ok = args.loss_bad >= args.loss_patience
-
-                if args.stage_engineering and loss_ok and args.allow_stop : args.stopped = True
-            else:
-                args.prev_loss_ema = args.loss_ema
-
-
             print(f"{name} [{cur_step}/{steps}] Loss: {loss.item():.4f}")
             writer.add_scalar(f"Loss/{name}", loss.item(), cur_step)
 
-            if args.stopped or (cur_step >= steps):
-                break
-            
-        if args.stopped or (cur_step >= steps):
-            args.last_stage_step = cur_step
-            break
+            if early_stop:
+                loss_ema = loss.item() if loss_ema is None else beta * loss_ema + (1-beta) * loss.item()
+                if cur_step > steps * 0.2:
+                    if loss_ema < loss_best - 1e-4:
+                        loss_best = loss_ema
+                        loss_bad = 0
+                    else:
+                        loss_bad += 1
+                    loss_ok = loss_bad >= 60  # LOSS_PATIENCE
+                    if loss_ok:
+                        return cur_step
 
+            if cur_step == steps:
+                break
         if on_epoch_end and batch_index == len(loader):
             on_epoch_end(cur_step)
+
+    return cur_step
 
 
 def evaluate(method, loader, classifier, device, split):
@@ -122,10 +115,10 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         apply_lora(method.model.vision_model)
         apply_lora(method.model.text_model)
         parameters = mark_only_lora_as_trainable(method.model)
-    if args.peft == "ln":
-        parameters = mark_only_layernorm_as_trainable(method.model)
-    if args.peft == "ln_half":
+    elif args.peft == "ln_half":
         parameters = mark_only_half_layernorm_as_trainable(method.model)
+    else:
+        parameters = mark_only_layernorm_as_trainable(method.model)
 
     on_epoch_end = None
     if args.setting == "base2new":
@@ -162,11 +155,8 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
 
         on_epoch_end = track_breakpoint
 
-
     method.train()
-    args.allow_stop = True
-    train_stage(
-        args,
+    stage_one_steps_run = train_stage(
         method.stage_one_logits,
         parameters,
         train_loader,
@@ -175,20 +165,17 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         device,
         "stage1",
         writer,
-        on_epoch_end
+        on_epoch_end,
+        early_stop=args.ema_early_stop,
     )
-
-    args.stopped = False
-    args.allow_stop = False
 
     method.initialize_classifier()
     method.eval()
-    train_stage(
-        args,
+    stage_two_steps_run = train_stage(
         method.stage_two_logits,
         [method.classifier],
         train_loader,
-        total_steps - args.last_stage_step,
+        total_steps - stage_one_steps_run,
         args.lr,
         device,
         "stage2",
@@ -223,8 +210,7 @@ def parse_args():
     parser.add_argument("--stage_one_ratio", type=float, default=0.6)
     parser.add_argument("--setting", choices=["standard", "base2new"], default="standard")
     parser.add_argument("--data_root", default="data")
-    parser.add_argument("--stage_engineering", type=int, default=False)
-    parser.add_argument("--loss_patience", type=int, default=60)
+    parser.add_argument("--ema_early_stop", action="store_true")
     return parser.parse_args()
 
 
