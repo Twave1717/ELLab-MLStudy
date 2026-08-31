@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from methods.twostage import TwoStageCLIP
+from src.methods import TwoStageCLIP
 
 class PromptLearner(nn.Module):
     def __init__(self, clip_model, tokenizer, classnames, template, n_ctx=8):

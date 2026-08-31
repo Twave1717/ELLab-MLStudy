@@ -1,10 +1,14 @@
 /data
+/kaggle/
+/999_rethinking_fewshot_vlms/
 /checkpoint
 *__pycache__
 *.log
-/logs/
+/results/logs/
+/results/submission_*.csv
 .python-version
 temp_scripts
 tests
 PLAN.md
 temp/
+results/

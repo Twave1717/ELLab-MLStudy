@@ -6,24 +6,56 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 
-from architecture import CLIP_MODEL, load_clip
 from datasets import get_dataloader
 from datasets.vision.utils import GLOBAL_SEED
-from methods.twostage import TwoStageCLIP
-from peft import apply_lora, mark_only_layernorm_as_trainable, mark_only_lora_as_trainable
+from src.architecture import CLIP_MODEL, load_clip
+from src.methods import TwoStageCLIP
+from src.peft import (
+    AbsIdentityGate,
+    LoRAProOptimizer,
+    lora,
+    mark_only_half_layernorm_as_trainable,
+    mark_only_layernorm_as_trainable,
+    TwoStageKgCoOp,
+)
 
-def train_stage(method, parameters, loader, steps, lr, device, name, writer, on_epoch_end=None):
-    optimizer = torch.optim.AdamW(parameters, lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps, eta_min=1e-6)
+def train_stage(
+    method, stage_name, parameters, loader, steps, lr, device, name, writer,
+    on_epoch_end=None, gradient_gate=None, optimizer=None, eta_min=1e-6,
+    early_stop=False,
+):
+    if optimizer is None:
+        optimizer = torch.optim.AdamW(parameters, lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, steps, eta_min=eta_min
+    )
     scaler = torch.amp.GradScaler()
     cur_step = 0
+    beta = 0.98
+    loss_ema = None
+    loss_best = float('inf')
+    loss_bad = 0
 
     while cur_step < steps:
         for batch_index, (images, labels) in enumerate(loader, 1):
             optimizer.zero_grad()
             images, labels = images.to(device), labels.to(device)
             with torch.amp.autocast(device):
-                loss, logits = method.compute_loss(images, labels, stage=name)
+                if hasattr(method, "compute_loss"):
+                    loss, logits = method.compute_loss(images, labels, stage=stage_name)
+                    losses = loss 
+                else:
+                    logits_fn = method.stage_one_logits if stage_name == "stage1" else method.stage_two_logits
+                    losses = F.cross_entropy(
+                        logits_fn(images), labels,
+                        reduction="none" if gradient_gate else "mean",
+                    )
+                    loss = losses.mean() if gradient_gate else losses
+
+            previous = q = None
+            # KgCoOp 사용 시에는 gradient_gate 스킵
+            if gradient_gate and not hasattr(method, "compute_loss"):
+                previous, q = gradient_gate.prepare(losses, cur_step + 1)
 
             scale = scaler.get_scale()
             scaler.scale(loss).backward()
@@ -31,15 +63,34 @@ def train_stage(method, parameters, loader, steps, lr, device, name, writer, on_
             scaler.update()
             if scaler.get_scale() < scale:
                 continue
+            if gradient_gate and not hasattr(method, "compute_loss"):
+                gradient_gate.apply(previous, q)
+                writer.add_scalar(f"Q/{name}", q.mean().item(), cur_step + 1)
 
             scheduler.step()
             cur_step += 1
+
             print(f"{name} [{cur_step}/{steps}] Loss: {loss.item():.4f}")
             writer.add_scalar(f"Loss/{name}", loss.item(), cur_step)
+
+            if early_stop:
+                loss_ema = loss.item() if loss_ema is None else beta * loss_ema + (1-beta) * loss.item()
+                if cur_step > steps * 0.2:
+                    if loss_ema < loss_best - 1e-4:
+                        loss_best = loss_ema
+                        loss_bad = 0
+                    else:
+                        loss_bad += 1
+                    loss_ok = loss_bad >= 60  
+                    if loss_ok:
+                        return cur_step
+
             if cur_step == steps:
                 break
         if on_epoch_end and batch_index == len(loader):
             on_epoch_end(cur_step)
+
+    return cur_step
 
 def evaluate(method, loader, classifier, device, split):
     total_loss, total_correct, total_size = 0, 0, 0
@@ -87,32 +138,41 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
     stage_one_steps = int(total_steps * args.stage_one_ratio)
     method.to(device)
 
-    # 통합된 PEFT 적용
+    #다중 peft 적용
     peft_methods = args.peft.split('+')
     
     method.model.requires_grad_(False)
     if hasattr(method, 'prompt_learner'):
         method.prompt_learner.requires_grad_(False)
-        
+
     if 'lora' in peft_methods:
-        apply_lora(method.model.vision_model)
-        apply_lora(method.model.text_model)
+        lora.apply_lora_to_clip(
+            method.model,
+            targets=args.lora_targets,
+            blocks=args.lora_blocks,
+            modality=args.lora_modality,
+            rank=args.lora_rank,
+        )
         
     if 'ln' in peft_methods:
-        for encoder in (method.model.vision_model, method.model.text_model):
-            for module in encoder.modules():
-                if isinstance(module, torch.nn.LayerNorm):
-                    module.requires_grad_(True)
-                    
+        mark_only_layernorm_as_trainable(method.model)
+    elif 'ln_half' in peft_methods:
+        mark_only_half_layernorm_as_trainable(method.model)
+        
     if 'lora' in peft_methods:
-        for name, param in method.model.named_parameters():
-            if "lora_a." in name or "lora_b." in name:
-                param.requires_grad_(True)
-                
+        lora.mark_only_lora_as_trainable(method.model)
+        
     if 'kgcoop' in peft_methods:
         method.prompt_learner.requires_grad_(True)
-        
-    parameters = [p for p in method.parameters() if p.requires_grad]
+
+    parameters = [parameter for parameter in method.parameters() if parameter.requires_grad]
+    if not parameters:
+        raise RuntimeError(f"No trainable parameters found after applying PEFT mode: {args.peft}")
+
+    gradient_gate = None
+    if args.gradient_gate == "abs_identity":
+        gradient_gate = AbsIdentityGate(parameters)
+        gradient_gate.initialize(method.stage_one_logits, train_loader.dataset, device)
 
     on_epoch_end = None
     if args.setting == "base2new":
@@ -157,8 +217,17 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         on_epoch_end = track_breakpoint
 
     method.train()
-    train_stage(
+    stage_one_optimizer = None
+    stage_one_eta_min = 1e-6
+    if "lora" in peft_methods and args.stage1_optimizer == "lora_pro":
+        stage_one_optimizer = LoRAProOptimizer(
+            lora.lora_modules(method.model), args.lora_pro_lr
+        )
+        stage_one_eta_min = args.lora_pro_lr / 100
+        
+    stage_one_steps_run = train_stage(
         method,
+        "stage1",
         parameters,
         train_loader,
         stage_one_steps,
@@ -166,16 +235,21 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         device,
         "stage1",
         writer,
-        on_epoch_end
+        on_epoch_end,
+        gradient_gate,
+        optimizer=stage_one_optimizer,
+        eta_min=stage_one_eta_min,
+        early_stop=args.ema_early_stop,
     )
 
     method.initialize_classifier()
     method.eval()
-    train_stage(
+    stage_two_steps_run = train_stage(
         method,
+        "stage2",
         [method.classifier],
         train_loader,
-        total_steps - stage_one_steps,
+        total_steps - stage_one_steps_run,
         args.lr,
         device,
         "stage2",
@@ -202,18 +276,37 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="cifar10")
     parser.add_argument("--shots", type=int, choices=[1, 2, 4, 8, 16], default=1)
-    parser.add_argument("--peft", type=str, default="ln", help="PEFT methods to use, separated by '+' (e.g., kgcoop+lora)")
+    
+    # PEFT 다중 선택 지원을 위해 type=str로 변경
+    parser.add_argument("--peft", type=str, default="ln", help="PEFT methods, separated by '+' (e.g., kgcoop+lora)")
+    
+    parser.add_argument("--gradient_gate", choices=["none", "abs_identity"], default="none")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--steps_per_shot", type=int, default=300)
     parser.add_argument("--stage_one_ratio", type=float, default=0.6)
     parser.add_argument("--setting", choices=["standard", "base2new"], default="standard")
     parser.add_argument("--data_root", default="data")
-
-    #kgcoop
+    parser.add_argument("--ema_early_stop", action="store_true")
+    
+    # LoRA 인자들
+    parser.add_argument("--lora_targets", nargs="+", choices=lora.TARGETS, default=["q", "k", "v"])
+    parser.add_argument("--lora_blocks", choices=["all", "odd", "even"], default="all")
+    parser.add_argument("--lora_modality", choices=["both", "vision", "text"], default="both")
+    parser.add_argument("--lora_rank", type=int, default=lora.RANK)
+    parser.add_argument("--stage1_optimizer", choices=["adamw", "lora_pro"], default="adamw")
+    parser.add_argument("--lora_pro_lr", type=float, default=2e-6)
+    
+    # KgCoOp 인자들
     parser.add_argument("--n_ctx", type=int, default=8, help="KgCoOp context length")
     parser.add_argument("--w", type=float, default=8.0, help="KgCoOp discrepancy loss weight")
-    return parser.parse_args()
+    
+    args = parser.parse_args()
+    
+    if args.stage1_optimizer == "lora_pro" and "lora" not in args.peft:
+        parser.error("--stage1_optimizer lora_pro requires 'lora' in --peft")
+        
+    return args
 
 def main():
     args = parse_args()
@@ -233,7 +326,6 @@ def main():
     peft_methods = args.peft.split('+')
     
     if "kgcoop" in peft_methods:
-        from peft.kgcoop import TwoStageKgCoOp
         method = TwoStageKgCoOp(
             model,
             tokenizer,
@@ -251,8 +343,25 @@ def main():
         )
         
     run_name = f"{args.dataset}-{args.peft}-{args.shots}shot-ratio{args.stage_one_ratio}"
+    if args.gradient_gate != "none":
+        run_name += f"-{args.gradient_gate}"
     if args.setting == "base2new":
         run_name += "-base2new"
+    if "lora" in peft_methods and (
+        args.lora_targets != ["q", "k", "v"]
+        or args.lora_blocks != "all"
+        or args.lora_modality != "both"
+        or args.lora_rank != lora.RANK
+        or args.stage1_optimizer != "adamw"
+    ):
+        targets = "".join(args.lora_targets)
+        run_name += (
+            f"-{targets}-{args.lora_blocks}-{args.lora_modality}"
+            f"-r{args.lora_rank}-{args.stage1_optimizer}"
+        )
+        if args.stage1_optimizer == "lora_pro":
+            run_name += f"-lr{args.lora_pro_lr:g}"
+            
     with SummaryWriter(f"runs/2sfs/{run_name}") as writer:
         train_2sfs(
             args,

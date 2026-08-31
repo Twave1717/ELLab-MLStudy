@@ -48,6 +48,16 @@ chmod +x tensorboard.sh
 ./tensorboard.sh
 ```
 
+Kaggle 3종 데이터셋의 breakpoint 탐색과 논문의 LayerNorm 고정 비율 비교는
+`notebook/01_find_breakpoints.ipynb`, `notebook/02_compare_breakpoint_ratios.ipynb`에서
+순서대로 따라 할 수 있습니다. 두 노트북은 실험 원리, 입력 점검, 단일 GPU 순차 실행,
+결과 해석을 단계별로 설명합니다. 핵심 breakpoint 탐색과 2-stage 비교 함수는
+노트북에 직접 제시하고, manifest 로딩은 `notebook/utils/data.py`, 공통 학습·평가와
+checkpoint는 `notebook/utils/experiment.py`, 결과 요약과 submission 생성은
+`notebook/utils/results.py`에서 호출합니다. 모델은 기존 `src/methods/twostage.py`의
+`TwoStageCLIP`을 그대로 사용합니다.
+완료된 실험 요약과 breakpoint 차트는 `results/report/README.md`에 있습니다.
+
 ## Methods
 
 | Method | 지원 architecture | 비고 |
@@ -87,6 +97,9 @@ CLIP zero-shot은 지정한 데이터셋의 test split을 사용합니다. RotNe
 evaluation은 현재 `rotnet-4`와 CIFAR-10만 지원합니다.
 
 ## Architectures
+
+모델 architecture, 학습 method, evaluation head, PEFT 구현은 각각
+`src/architecture`, `src/methods`, `src/eval`, `src/peft`에 있습니다.
 
 ### From scratch
 
