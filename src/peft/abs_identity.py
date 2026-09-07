@@ -38,7 +38,7 @@ class AbsIdentityGate:
             for gradient, parameter in zip(gradients, self.parameters)
         ])
 
-    def initialize(self, logits_fn, dataset, device):
+    def initialize(self, logits_fn, dataset, device, loss_fn=None):
         python_state = random.getstate()
         torch_state = torch.random.get_rng_state()
         cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
@@ -56,7 +56,11 @@ class AbsIdentityGate:
             images = torch.stack([sample[0] for sample in samples]).to(device)
             labels = torch.tensor([int(sample[1]) for sample in samples], device=device)
             with torch.amp.autocast(device):
-                losses = F.cross_entropy(logits_fn(images), labels, reduction="none")
+                losses = (
+                    F.cross_entropy(logits_fn(images), labels, reduction="none")
+                    if loss_fn is None
+                    else loss_fn(images, labels, reduction="none")
+                )
             for index, loss in enumerate(losses):
                 gradient = self._flat_gradient(loss, retain_graph=index + 1 < len(losses)).detach()
                 first_sum = gradient.abs() if first_sum is None else first_sum + gradient.abs()

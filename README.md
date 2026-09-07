@@ -276,6 +276,17 @@ EMA 계수는 0.98이며 전체 예산의 20% 이후부터 개선 폭 1e-4 미�
 0 step입니다. 실제 단계별 step 수와 전환 방식은 JSON의 `metrics.training`에
 기록됩니다.
 
+KgCoOp는 `--peft kgcoop`, `kgcoop+ln`, `kgcoop+ln_half`, `kgcoop+lora`,
+`kgcoop+ln+lora`처럼 조합할 수 있습니다. 기존 `ln_lora`는 `ln+lora`의
+별칭으로 유지됩니다. `--n_ctx`(기본 8), `--w`(기본 8.0)로 context 길이와
+discrepancy loss 가중치를 지정합니다. KgCoOp에서도 `--ema_early_stop`과
+`--gradient_gate abs_identity`를 사용할 수 있으며, EMA와 DG는 CE와
+discrepancy를 합한 같은 학습 loss를 사용합니다. 공유 token embedding은
+고정하고 context 및 명시적으로 선택한 LN/LoRA만 학습합니다.
+LoRA-Pro는 다른 학습 파라미터가 누락되지 않도록 `--peft lora` 단독만
+허용합니다. KgCoOp의 novel 평가는 기존 main과 같이 고정 template을
+사용하며, 학습 context를 novel 클래스에 전이하는 평가는 아닙니다.
+
 아래 split 설명은 `train.py`의 일반 vision loader에만 적용됩니다.
 
 공식 validation split이 있는 DTD, FGVCAircraft, Flowers102는 이를 그대로

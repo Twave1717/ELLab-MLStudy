@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import json
+import math
 import random
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from src.methods import TwoStageCLIP
 from src.peft import (
     AbsIdentityGate,
     LoRAProOptimizer,
+    TwoStageKgCoOp,
     lora,
     mark_only_half_layernorm_as_trainable,
     mark_only_layernorm_as_trainable,
@@ -28,6 +30,7 @@ from src.peft import (
 def train_stage(
     logits_fn, parameters, loader, steps, lr, device, name, writer,
     gradient_gate=None, optimizer=None, eta_min=1e-6, early_stop=False,
+    loss_fn=None,
 ):
     if optimizer is None:
         optimizer = torch.optim.AdamW(parameters, lr=lr)
@@ -46,9 +49,11 @@ def train_stage(
             optimizer.zero_grad()
             images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             with torch.amp.autocast(device):
-                losses = F.cross_entropy(
-                    logits_fn(images), labels,
-                    reduction="none" if gradient_gate else "mean",
+                reduction = "none" if gradient_gate else "mean"
+                losses = (
+                    F.cross_entropy(logits_fn(images), labels, reduction=reduction)
+                    if loss_fn is None
+                    else loss_fn(images, labels, reduction=reduction)
                 )
                 loss = losses.mean() if gradient_gate else losses
 
@@ -140,8 +145,26 @@ def reset_train_stream(loader, seed):
     sampler_generator.manual_seed(seed)
 
 
+def peft_methods(value):
+    return set(value.replace("ln_lora", "ln+lora").split("+"))
+
+
+def parse_peft(value):
+    parts = value.replace("ln_lora", "ln+lora").split("+")
+    supported = ("kgcoop", "ln", "ln_half", "lora")
+    if any(part not in supported for part in parts) or len(set(parts)) != len(parts):
+        raise argparse.ArgumentTypeError("Use distinct PEFT methods: kgcoop, ln, ln_half, lora")
+    if "ln" in parts and "ln_half" in parts:
+        raise argparse.ArgumentTypeError("Choose ln or ln_half, not both")
+    if set(parts) == {"ln", "lora"}:
+        return "ln_lora"
+    return "+".join(part for part in supported if part in parts)
+
+
 def config_fingerprint(args):
     excluded = {"data_root", "results_dir"}
+    if "kgcoop" not in peft_methods(getattr(args, "peft", "ln")):
+        excluded.update({"n_ctx", "w"})
     config = {
         key: value for key, value in vars(args).items() if key not in excluded
     }
@@ -158,7 +181,15 @@ def train_2sfs(args, method, train_loader, test_loader, device, writer):
     )
     method.to(device)
 
-    if args.peft in ("lora", "ln_lora"):
+    methods = peft_methods(args.peft)
+    method.model.requires_grad_(False)
+    if "kgcoop" in methods:
+        method.prompt_learner.requires_grad_(False)
+    if "ln" in methods:
+        mark_only_layernorm_as_trainable(method.model)
+    elif "ln_half" in methods:
+        mark_only_half_layernorm_as_trainable(method.model)
+    if "lora" in methods:
         lora.apply_lora_to_clip(
             method.model,
             targets=args.lora_targets,
@@ -166,24 +197,25 @@ def train_2sfs(args, method, train_loader, test_loader, device, writer):
             modality=args.lora_modality,
             rank=args.lora_rank,
         )
-        lora.mark_only_lora_as_trainable(method.model)
-        if args.peft == "ln_lora":
-            for module in method.model.modules():
-                if isinstance(module, torch.nn.LayerNorm):
-                    module.requires_grad_(True)
-    elif args.peft == "ln_half":
-        mark_only_half_layernorm_as_trainable(method.model)
-    else:
-        mark_only_layernorm_as_trainable(method.model)
+        # Enable adapters without freezing any selected LayerNorm parameters.
+        for module in lora.lora_modules(method.model).values():
+            module.lora_a.requires_grad_(True)
+            module.lora_b.requires_grad_(True)
+    if "kgcoop" in methods:
+        # The learner also references the frozen backbone token embedding.
+        method.prompt_learner.ctx.requires_grad_(True)
 
-    parameters = [parameter for parameter in method.model.parameters() if parameter.requires_grad]
+    parameters = [parameter for parameter in method.parameters() if parameter.requires_grad]
     if not parameters:
         raise RuntimeError(f"No trainable parameters found after applying PEFT mode: {args.peft}")
 
+    loss_fn = method.stage_one_loss if "kgcoop" in methods else None
     gradient_gate = None
     if args.gradient_gate == "abs_identity":
         gradient_gate = AbsIdentityGate(parameters, seed=GLOBAL_SEED)
-        gradient_gate.initialize(method.stage_one_logits, train_loader.dataset, device)
+        gradient_gate.initialize(
+            method.stage_one_logits, train_loader.dataset, device, loss_fn=loss_fn
+        )
 
     seed_training(GLOBAL_SEED)
     reset_train_stream(train_loader, GLOBAL_SEED)
@@ -208,6 +240,7 @@ def train_2sfs(args, method, train_loader, test_loader, device, writer):
         optimizer=stage_one_optimizer,
         eta_min=stage_one_eta_min,
         early_stop=args.ema_early_stop,
+        loss_fn=loss_fn,
     )
 
     method.initialize_classifier()
@@ -281,7 +314,8 @@ def parse_args():
         "--split_seed", type=int, choices=OFFICIAL_SPLIT_SEEDS, default=1
     )
     parser.add_argument(
-        "--peft", choices=["ln", "lora", "ln_lora", "ln_half"], default="ln"
+        "--peft", type=parse_peft, default="ln",
+        help="PEFT methods joined with +; ln_lora remains an alias for ln+lora",
     )
     parser.add_argument("--gradient_gate", choices=["none", "abs_identity"], default="none")
     parser.add_argument("--batch_size", type=int, default=32)
@@ -303,13 +337,21 @@ def parse_args():
     parser.add_argument("--lora_rank", type=int, default=lora.RANK)
     parser.add_argument("--stage1_optimizer", choices=["adamw", "lora_pro"], default="adamw")
     parser.add_argument("--lora_pro_lr", type=float, default=2e-6)
+    parser.add_argument("--n_ctx", type=int, default=8, help="KgCoOp context length")
+    parser.add_argument("--w", type=float, default=8.0, help="KgCoOp discrepancy loss weight")
     args = parser.parse_args()
     if args.stage1_optimizer == "lora_pro" and args.peft != "lora":
-        parser.error("--stage1_optimizer lora_pro requires --peft lora")
+        parser.error("--stage1_optimizer lora_pro requires --peft lora alone")
     if args.workers < 0:
         parser.error("--workers cannot be negative")
+    if args.n_ctx <= 0 or not math.isfinite(args.w) or args.w < 0:
+        parser.error("--n_ctx must be positive and --w must be finite and nonnegative")
+    if args.steps_per_shot <= 0 or args.batch_size <= 0 or args.test_batch_size <= 0:
+        parser.error("Step and batch sizes must be positive")
     if args.ema_early_stop:
         args.stage_one_ratio = None
+    elif not 0 <= args.stage_one_ratio <= 1:
+        parser.error("--stage_one_ratio must be between 0 and 1")
     return args
 
 
@@ -332,11 +374,15 @@ def main():
         num_workers=args.workers,
     )
     model, tokenizer = load_clip(CLIP_MODEL)
-    method = TwoStageCLIP(
+    methods = peft_methods(args.peft)
+    method_class = TwoStageKgCoOp if "kgcoop" in methods else TwoStageCLIP
+    method_options = {"n_ctx": args.n_ctx, "w": args.w} if "kgcoop" in methods else {}
+    method = method_class(
         model,
         tokenizer,
         train_loader.dataset.classes,
-        train_loader.dataset.template
+        train_loader.dataset.template,
+        **method_options,
     )
     stage_policy = "loss-ema" if args.ema_early_stop else f"ratio{args.stage_one_ratio}"
     run_name = (
@@ -348,7 +394,7 @@ def main():
         run_name += f"-{args.gradient_gate}"
     if args.setting == "base2new":
         run_name += "-base2new"
-    if args.peft in ("lora", "ln_lora") and (
+    if "lora" in methods and (
         args.lora_targets != ["q", "k", "v"]
         or args.lora_blocks != "all"
         or args.lora_modality != "both"
