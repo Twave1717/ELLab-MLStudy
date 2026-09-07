@@ -283,9 +283,26 @@ discrepancy loss 가중치를 지정합니다. KgCoOp에서도 `--ema_early_stop
 `--gradient_gate abs_identity`를 사용할 수 있으며, EMA와 DG는 CE와
 discrepancy를 합한 같은 학습 loss를 사용합니다. 공유 token embedding은
 고정하고 context 및 명시적으로 선택한 LN/LoRA만 학습합니다.
-LoRA-Pro는 다른 학습 파라미터가 누락되지 않도록 `--peft lora` 단독만
-허용합니다. KgCoOp의 novel 평가는 기존 main과 같이 고정 template을
+LoRA-Pro는 `--peft lora` 또는 Half-LN용 AdamW를 별도로 사용하는
+`--peft hybrid`에서 허용합니다. KgCoOp의 novel 평가는 기존 main과 같이 고정 template을
 사용하며, 학습 context를 novel 클래스에 전이하는 평가는 아닙니다.
+
+Half-LN + ODD QKV rank-1 LoRA-Pro는 다음과 같이 실행합니다.
+
+```bash
+uv run python train_2sfs.py --dataset dtd --shots 16 --split_seed 1 \
+  --setting base2new --peft hybrid --lora_targets q k v --lora_blocks odd \
+  --lora_modality both --lora_rank 1 --stage1_optimizer lora_pro \
+  --lora_pro_lr 2e-6 --lr 2e-4 --ema_early_stop
+```
+
+`hybrid`는 DG와 조합하지 않습니다. EMA는 다른 방식과 동일하게 고정 0.6
+제한 없이 전체 예산 안에서 전환합니다. Base-to-new에서는 단계 종료 시
+공식 원본 validation 전체를 base/novel로 나누어 평가합니다. 기존 few-shot
+validation 반환은 다른 방식에서 그대로 유지하며, train/test split도 바꾸지
+않습니다. 추가 validation은 관찰용이며 EMA·모델 선택에 사용하지 않습니다.
+단계별 base/novel/HM은 TensorBoard, run 폴더의 `metrics.json`, 최종 결과
+JSON의 `metrics.validation`에 기록됩니다.
 
 아래 split 설명은 `train.py`의 일반 vision loader에만 적용됩니다.
 

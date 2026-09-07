@@ -30,14 +30,28 @@ from src.peft import (
 def train_stage(
     logits_fn, parameters, loader, steps, lr, device, name, writer,
     gradient_gate=None, optimizer=None, eta_min=1e-6, early_stop=False,
-    loss_fn=None,
+    loss_fn=None, ln_optimizer=None,
 ):
+    parameters = list(parameters)
     if optimizer is None:
+        if ln_optimizer is not None:
+            raise ValueError("Hybrid training needs an explicit LoRA optimizer")
         optimizer = torch.optim.AdamW(parameters, lr=lr)
+    if ln_optimizer is not None:
+        primary = {id(p) for group in optimizer.param_groups for p in group["params"]}
+        secondary = {id(p) for group in ln_optimizer.param_groups for p in group["params"]}
+        if primary & secondary or primary | secondary != {id(p) for p in parameters}:
+            raise ValueError("Hybrid optimizers must partition the trainable parameters")
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, steps, eta_min=eta_min
     )
-    scaler = torch.amp.GradScaler()
+    ln_scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(ln_optimizer, steps, eta_min=1e-6)
+        if ln_optimizer is not None else None
+    )
+    device_type = torch.device(device).type
+    scaler = torch.amp.GradScaler(device_type if ln_optimizer is not None else "cuda")
+    consecutive_skips = 0
     cur_step = 0
     beta = 0.98
     loss_ema = None
@@ -47,8 +61,12 @@ def train_stage(
     while cur_step < steps:
         for images, labels in loader:
             optimizer.zero_grad()
+            if ln_optimizer is not None:
+                ln_optimizer.zero_grad()
             images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-            with torch.amp.autocast(device):
+            with torch.amp.autocast(
+                device_type, enabled=ln_optimizer is None or device_type == "cuda"
+            ):
                 reduction = "none" if gradient_gate else "mean"
                 losses = (
                     F.cross_entropy(logits_fn(images), labels, reduction=reduction)
@@ -63,15 +81,41 @@ def train_stage(
 
             scale = scaler.get_scale()
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
+            if ln_optimizer is not None:
+                scaler.unscale_(optimizer)
+                scaler.unscale_(ln_optimizer)
+                if not all(p.grad is None or torch.isfinite(p.grad).all() for p in parameters):
+                    scaler.update()
+                    consecutive_skips += 1
+                    if consecutive_skips >= 100:
+                        raise FloatingPointError("100 consecutive hybrid gradient overflows")
+                    continue
+                # Both optimizers update only after their combined gradients pass.
+                for current_optimizer in (optimizer, ln_optimizer):
+                    current_optimizer.step()
+                    tensors = [p for group in current_optimizer.param_groups for p in group["params"]]
+                    tensors += [
+                        value for state in current_optimizer.state.values()
+                        for value in state.values() if torch.is_tensor(value)
+                    ]
+                    if not all(torch.isfinite(tensor).all() for tensor in tensors):
+                        raise FloatingPointError("Non-finite hybrid optimizer parameter or state")
+            else:
+                scaler.step(optimizer)
             scaler.update()
             if scaler.get_scale() < scale:
+                consecutive_skips += 1
+                if consecutive_skips >= 100:
+                    raise FloatingPointError(f"100 consecutive {name} gradient overflows")
                 continue
+            consecutive_skips = 0
             if gradient_gate:
                 gradient_gate.apply(previous, q)
                 writer.add_scalar(f"Q/{name}", q.mean().item(), cur_step + 1)
 
             scheduler.step()
+            if ln_scheduler is not None:
+                ln_scheduler.step()
             cur_step += 1
 
             print(f"{name} [{cur_step}/{steps}] Loss: {loss.item():.4f}")
@@ -146,10 +190,14 @@ def reset_train_stream(loader, seed):
 
 
 def peft_methods(value):
+    if value == "hybrid":
+        return {"ln_half", "lora"}
     return set(value.replace("ln_lora", "ln+lora").split("+"))
 
 
 def parse_peft(value):
+    if value == "hybrid":
+        return value
     parts = value.replace("ln_lora", "ln+lora").split("+")
     supported = ("kgcoop", "ln", "ln_half", "lora")
     if any(part not in supported for part in parts) or len(set(parts)) != len(parts):
@@ -173,13 +221,50 @@ def config_fingerprint(args):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:10]
 
 
-def train_2sfs(args, method, train_loader, test_loader, device, writer):
+def record_validation(method, loaders, device, writer, stage, step, results):
+    was_training = method.training
+    method.eval()
+    try:
+        # Monitoring must not perturb the training RNG stream.
+        with torch.random.fork_rng(devices=[]), torch.no_grad():
+            base_loader, novel_loader = loaders
+            classifier = method.classifier if method.classifier is not None else method.encode_text()
+            base = evaluate(method, base_loader, classifier, device, f"{stage} validation base")
+            novel = evaluate(
+                method, novel_loader, method.encode_classnames(novel_loader.dataset.classes),
+                device, f"{stage} validation novel",
+            )
+    finally:
+        method.train(was_training)
+    scores = {
+        "base": base["accuracy"], "novel": novel["accuracy"],
+        "hm": harmonic_mean(base["accuracy"], novel["accuracy"]),
+    }
+    results[stage] = {
+        "step": step, **scores,
+        "base_total": base["total"], "novel_total": novel["total"],
+    }
+    for key, value in scores.items():
+        writer.add_scalar(f"Accuracy/validation_{stage}_end_{key}", value, step)
+    path = Path(writer.log_dir) / "metrics.json"
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(results, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    temporary.replace(path)
+    writer.flush()
+
+
+def train_2sfs(args, method, train_loader, test_loader, device, writer, validation_loader=None):
     total_steps = args.shots * args.steps_per_shot
     stage_one_steps = (
         total_steps if args.ema_early_stop
         else int(total_steps * args.stage_one_ratio)
     )
     method.to(device)
+    monitor_validation = args.peft == "hybrid" and args.setting == "base2new"
+    if monitor_validation and (
+        not isinstance(validation_loader, tuple) or len(validation_loader) != 2
+    ):
+        raise ValueError("Hybrid base2new requires full official base/novel validation loaders")
 
     methods = peft_methods(args.peft)
     method.model.requires_grad_(False)
@@ -221,12 +306,20 @@ def train_2sfs(args, method, train_loader, test_loader, device, writer):
     reset_train_stream(train_loader, GLOBAL_SEED)
     method.train()
     stage_one_optimizer = None
+    ln_optimizer = None
     stage_one_eta_min = 1e-6
-    if args.peft == "lora" and args.stage1_optimizer == "lora_pro":
+    if args.peft in ("lora", "hybrid") and args.stage1_optimizer == "lora_pro":
         stage_one_optimizer = LoRAProOptimizer(
             lora.lora_modules(method.model), args.lora_pro_lr
         )
         stage_one_eta_min = args.lora_pro_lr / 100
+        if args.peft == "hybrid":
+            ln_parameters = [
+                parameter for module in method.model.modules()
+                if isinstance(module, torch.nn.LayerNorm)
+                for parameter in module.parameters() if parameter.requires_grad
+            ]
+            ln_optimizer = torch.optim.AdamW(ln_parameters, lr=args.lr)
     stage_one_steps_run = train_stage(
         method.stage_one_logits,
         parameters,
@@ -241,8 +334,15 @@ def train_2sfs(args, method, train_loader, test_loader, device, writer):
         eta_min=stage_one_eta_min,
         early_stop=args.ema_early_stop,
         loss_fn=loss_fn,
+        ln_optimizer=ln_optimizer,
     )
 
+    validation_metrics = {}
+    if monitor_validation:
+        record_validation(
+            method, validation_loader, device, writer, "stage1",
+            stage_one_steps_run, validation_metrics,
+        )
     method.initialize_classifier()
     method.eval()
     seed_training(GLOBAL_SEED)
@@ -265,6 +365,11 @@ def train_2sfs(args, method, train_loader, test_loader, device, writer):
     }
 
     method.eval()
+    if monitor_validation:
+        record_validation(
+            method, validation_loader, device, writer, "stage2",
+            training_metrics["total_steps"], validation_metrics,
+        )
     if args.setting == "base2new":
         test_base_loader, test_novel_loader = test_loader
         base_metrics = evaluate(
@@ -290,6 +395,7 @@ def train_2sfs(args, method, train_loader, test_loader, device, writer):
         writer.add_scalar("Accuracy/test_harmonic_mean", hm, 0)
         return {
             "training": training_metrics,
+            **({"validation": validation_metrics} if monitor_validation else {}),
             "test": {
                 "base": base_metrics,
                 "novel": novel_metrics,
@@ -315,7 +421,7 @@ def parse_args():
     )
     parser.add_argument(
         "--peft", type=parse_peft, default="ln",
-        help="PEFT methods joined with +; ln_lora remains an alias for ln+lora",
+        help="PEFT methods joined with +, or hybrid (Half-LN + LoRA-Pro)",
     )
     parser.add_argument("--gradient_gate", choices=["none", "abs_identity"], default="none")
     parser.add_argument("--batch_size", type=int, default=32)
@@ -340,8 +446,12 @@ def parse_args():
     parser.add_argument("--n_ctx", type=int, default=8, help="KgCoOp context length")
     parser.add_argument("--w", type=float, default=8.0, help="KgCoOp discrepancy loss weight")
     args = parser.parse_args()
-    if args.stage1_optimizer == "lora_pro" and args.peft != "lora":
-        parser.error("--stage1_optimizer lora_pro requires --peft lora alone")
+    if args.stage1_optimizer == "lora_pro" and args.peft not in ("lora", "hybrid"):
+        parser.error("--stage1_optimizer lora_pro requires --peft lora or hybrid")
+    if args.peft == "hybrid" and (
+        args.stage1_optimizer != "lora_pro" or args.gradient_gate != "none"
+    ):
+        parser.error("--peft hybrid requires --stage1_optimizer lora_pro and --gradient_gate none")
     if args.workers < 0:
         parser.error("--workers cannot be negative")
     if args.n_ctx <= 0 or not math.isfinite(args.w) or args.w < 0:
@@ -362,7 +472,7 @@ def main():
     torch.backends.cudnn.benchmark = False
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    train_loader, _, test_loader, _ = build_official_2sfs_loaders(
+    train_loader, validation_loader, test_loader, _ = build_official_2sfs_loaders(
         batch_size=args.batch_size,
         dataset_name=args.dataset,
         root=args.data_root,
@@ -372,6 +482,7 @@ def main():
         training_seed=GLOBAL_SEED,
         test_batch_size=args.test_batch_size,
         num_workers=args.workers,
+        full_validation=args.peft == "hybrid" and args.setting == "base2new",
     )
     model, tokenizer = load_clip(CLIP_MODEL)
     methods = peft_methods(args.peft)
@@ -417,7 +528,8 @@ def main():
             train_loader,
             test_loader,
             device,
-            writer
+            writer,
+            validation_loader=validation_loader,
         )
     result = {
         "schema_version": "2sfs-result-v1",

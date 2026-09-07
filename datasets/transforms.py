@@ -18,6 +18,13 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
+class ConvertRGB:
+    """Normalize PIL image modes before three-channel tensor normalization."""
+
+    def __call__(self, image):
+        return image.convert("RGB")
+
+
 class TwoViewTransform:
     def __init__(self, transform):
         self.transform = transform
@@ -44,6 +51,7 @@ def build_transforms(
         interpolation = InterpolationMode.BILINEAR
 
     train_transform = Compose([
+        ConvertRGB(),
         RandomResizedCrop(
             crop_size,
             interpolation=interpolation,
@@ -53,6 +61,7 @@ def build_transforms(
         Normalize(mean, std),
     ])
     test_transform = Compose([
+        ConvertRGB(),
         Resize(crop_size, interpolation=interpolation),
         CenterCrop(crop_size),
         ToTensor(),

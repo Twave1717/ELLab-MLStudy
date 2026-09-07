@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 from ..transforms import build_transforms
 
 from .upstream import build_dataset
+from .upstream.utils import Datum
 
 
 UPSTREAM_COMMIT = "64ac143c7d22803bfeeaadfe42f570220ab29b06"
@@ -500,7 +501,9 @@ def build_official_2sfs_loaders(
     training_seed=2026,
     test_batch_size=None,
     num_workers=8,
+    full_validation=False,
 ):
+    """Load official splits, optionally exposing full base/novel validation for monitoring."""
     if dataset_name not in OFFICIAL_2SFS_DATASETS:
         choices = ", ".join(OFFICIAL_2SFS_DATASETS)
         raise ValueError(
@@ -512,6 +515,8 @@ def build_official_2sfs_loaders(
         raise ValueError("Official 2SFS split_seed must be 1, 2, or 3")
     if setting not in ("standard", "base2new"):
         raise ValueError("Official 2SFS setting must be standard or base2new")
+    if full_validation and setting != "base2new":
+        raise ValueError("Full official validation requires the base2new setting")
     if num_workers < 0:
         raise ValueError("Official 2SFS num_workers cannot be negative")
 
@@ -571,6 +576,13 @@ def build_official_2sfs_loaders(
         source_paths,
         template,
     )
+    if full_validation:
+        protocol.update({
+            "validation_scope": "full_official_base_and_novel",
+            "validation_source": "entire_official_source_val_partition",
+            "validation_usage": "monitoring_only_not_used_for_training_or_model_selection",
+            "validation_manifest_usage": "verified_not_used_for_full_validation",
+        })
 
     train_dataset = OfficialDatumDataset(
         dataset.train_x,
@@ -647,5 +659,32 @@ def build_official_2sfs_loaders(
             pin_memory=pin_memory,
         )
         test_loader = (test_loader, test_new_loader)
+
+    if full_validation:
+        # Few-shot manifests stay verified above; monitoring uses the entire source val.
+        validation_loaders = []
+        class_groups = (
+            (0, dataset.classnames),
+            (len(dataset.classnames), dataset.test_new_classnames),
+        )
+        for index, (offset, classnames) in enumerate(class_groups):
+            items = [
+                Datum(impath=str(path), label=label - offset, classname=classname)
+                for path, (label, classname) in source_partitions["val"].items()
+                if offset <= label < offset + len(classnames)
+            ]
+            full_validation_dataset = OfficialDatumDataset(
+                items, root, test_transform, classnames, template, protocol
+            )
+            validation_loaders.append(DataLoader(
+                full_validation_dataset,
+                batch_size=test_batch_size,
+                shuffle=False,
+                generator=torch.Generator().manual_seed(training_seed + index + 1),
+                num_workers=num_workers,
+                drop_last=False,
+                pin_memory=pin_memory,
+            ))
+        validation_loader = tuple(validation_loaders)
 
     return train_loader, validation_loader, test_loader, len(train_dataset.classes)
