@@ -12,19 +12,19 @@ def build_stanford_cars(root, train_transform, test_transform):
     train_dataset = StanfordCars(
         dataset_root,
         split="train",
-        download=True,
+        download=False,
         transform=train_transform,
     )
     val_dataset = StanfordCars(
         dataset_root,
         split="train",
-        download=True,
+        download=False,
         transform=test_transform,
     )
     test_dataset = StanfordCars(
         dataset_root,
         split="test",
-        download=True,
+        download=False,
         transform=test_transform,
     )
     return split_dataset(train_dataset, val_dataset, test_dataset)
