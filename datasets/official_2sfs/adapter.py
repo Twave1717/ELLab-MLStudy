@@ -608,6 +608,7 @@ def build_official_2sfs_loaders(
         sampler=train_sampler,
         generator=worker_generator,
         num_workers=num_workers,
+        persistent_workers=num_workers > 0,
         drop_last=False,
         pin_memory=pin_memory,
     )

@@ -269,8 +269,11 @@ uv run python train_2sfs.py --dataset dtd --shots 16 --split_seed 1 \
 공식 few-shot validation은 로딩만 하고 학습·모델 선택에는 사용하지 않습니다.
 `--setting base2new`의 최종 JSON에는 test base accuracy, novel accuracy,
 harmonic mean이 함께 저장됩니다. 기본 출력 위치는 `results/2sfs/`입니다.
-`--ema_early_stop`은 stage 1의 loss EMA로 중단 시점을 정하며 남은 step은
-stage 2에서 사용합니다. 실제 stage별 step 수는 JSON의 `metrics.training`에
+`--ema_early_stop`을 사용하면 `--stage_one_ratio` 대신 stage 1의 loss EMA로
+전환 시점을 정하고, 전체 step 예산 중 남은 step을 stage 2에서 사용합니다.
+EMA 계수는 0.98이며 전체 예산의 20% 이후부터 개선 폭 1e-4 미만인 step이
+60회 연속이면 전환합니다. 예산 소진까지 조건을 만족하지 않으면 stage 2는
+0 step입니다. 실제 단계별 step 수와 전환 방식은 JSON의 `metrics.training`에
 기록됩니다.
 
 아래 split 설명은 `train.py`의 일반 vision loader에만 적용됩니다.

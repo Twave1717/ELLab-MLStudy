@@ -44,7 +44,7 @@ def train_stage(
     while cur_step < steps:
         for images, labels in loader:
             optimizer.zero_grad()
-            images, labels = images.to(device), labels.to(device)
+            images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             with torch.amp.autocast(device):
                 losses = F.cross_entropy(
                     logits_fn(images), labels,
@@ -94,7 +94,7 @@ def evaluate(method, loader, classifier, device, split):
 
     with torch.no_grad():
         for images, labels in loader:
-            images, labels = images.to(device), labels.to(device)
+            images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             logits = method.classifier_logits(images, classifier)
             batch_size = labels.size(0)
             total_loss += F.cross_entropy(logits, labels).item() * batch_size
@@ -152,7 +152,10 @@ def config_fingerprint(args):
 
 def train_2sfs(args, method, train_loader, test_loader, device, writer):
     total_steps = args.shots * args.steps_per_shot
-    stage_one_steps = int(total_steps * args.stage_one_ratio)
+    stage_one_steps = (
+        total_steps if args.ema_early_stop
+        else int(total_steps * args.stage_one_ratio)
+    )
     method.to(device)
 
     if args.peft in ("lora", "ln_lora"):
@@ -222,6 +225,7 @@ def train_2sfs(args, method, train_loader, test_loader, device, writer):
         writer
     )
     training_metrics = {
+        "stage_switch": "loss_ema" if args.ema_early_stop else "fixed_ratio",
         "stage1_steps": stage_one_steps_run,
         "stage2_steps": stage_two_steps_run,
         "total_steps": stage_one_steps_run + stage_two_steps_run,
@@ -283,7 +287,10 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--steps_per_shot", type=int, default=300)
-    parser.add_argument("--stage_one_ratio", type=float, default=0.6)
+    parser.add_argument(
+        "--stage_one_ratio", type=float, default=0.6,
+        help="Stage 1 budget fraction; ignored with --ema_early_stop",
+    )
     parser.add_argument("--setting", choices=["standard", "base2new"], default="standard")
     parser.add_argument("--data_root", default="data")
     parser.add_argument("--test_batch_size", type=int, default=32)
@@ -301,6 +308,8 @@ def parse_args():
         parser.error("--stage1_optimizer lora_pro requires --peft lora")
     if args.workers < 0:
         parser.error("--workers cannot be negative")
+    if args.ema_early_stop:
+        args.stage_one_ratio = None
     return args
 
 
@@ -329,10 +338,11 @@ def main():
         train_loader.dataset.classes,
         train_loader.dataset.template
     )
+    stage_policy = "loss-ema" if args.ema_early_stop else f"ratio{args.stage_one_ratio}"
     run_name = (
         f"{args.dataset}-{args.peft}-{args.shots}shot"
         f"-split{args.split_seed}-seed{GLOBAL_SEED}"
-        f"-ratio{args.stage_one_ratio}"
+        f"-{stage_policy}"
     )
     if args.gradient_gate != "none":
         run_name += f"-{args.gradient_gate}"
