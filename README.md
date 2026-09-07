@@ -30,15 +30,19 @@ uv run python train.py \
 ```
 
 ```bash
-# 2SFS LayerNorm
+# 공식 2SFS split으로 LayerNorm
 uv run python train_2sfs.py \
-  --dataset cifar10 \
-  --shots 1
+  --dataset dtd \
+  --shots 16 \
+  --split_seed 1 \
+  --setting base2new
 
 # LoRA를 사용하려면 추가
 uv run python train_2sfs.py \
-  --dataset cifar10 \
-  --shots 1 \
+  --dataset dtd \
+  --shots 16 \
+  --split_seed 1 \
+  --setting base2new \
   --peft lora
 ```
 
@@ -219,6 +223,57 @@ CIFAR-10은 `data/cifar10/cifar-10-batches-py`, Imagenette는
 ImageNet은 `data/imagenet`, UCF101은 `data/ucf101` 아래에 원본 파일을
 직접 준비해야 합니다. UCF101은 video classification 대신 각 clip의 첫
 frame을 image classification 입력으로 사용합니다.
+
+### 공식 2SFS protocol
+
+`train_2sfs.py`는 일반 torchvision loader와 분리되어 있습니다. ImageNet을
+제외한 공식 2SFS 10개 데이터셋만 허용하며, 공식 코드 snapshot과 CoOp
+`split_zhou_*.json`, 공개 JSONL few-shot manifest를 그대로 사용합니다.
+
+1. [CoOp 안내](https://github.com/KaiyangZhou/CoOp/blob/main/DATASETS.md)에
+   따라 `--data_root` 아래에 원본 이미지를 canonical dataset 구조로
+   준비합니다.
+   UCF101은 CoOp의 `UCF-101-midframes` 이미지를 사용합니다.
+   Stanford Cars의 원본 링크가 열리지 않으면 검증한
+   [보존본](https://academictorrents.com/details/9c90b7f6208d430bff288845d45667ab2670da56)을
+   받아 `cars_train/`, `cars_test/`를 `data/stanford_cars/` 아래에 배치합니다.
+2. CoOp `split_zhou_*.json`과 공개 few-shot manifest를 공식 배포본의
+   checksum까지 검증해 설치합니다.
+
+```bash
+uv run python -m datasets.official_2sfs.prepare --data_root data
+```
+
+지원 데이터셋은 `caltech101`, `dtd`, `eurosat`, `fgvc`, `food101`,
+`oxford_flowers`, `oxford_pets`, `stanford_cars`, `sun397`, `ucf101`입니다.
+이번 공통 실험 대상은 다운로드·학습 검증을 완료한 9개이며, `sun397`은
+제외합니다. SUN397 loader 지원은 데이터를 별도로 준비한 경우 사용할 수 있습니다.
+공식 공개 split은 `--split_seed 1`, `2`, `3` 중 하나를 선택하며, 논문처럼
+세 split 결과를 평균할 수 있습니다. 이 값은 few-shot 표본을 다시 뽑는 RNG가
+아닙니다. 모델 학습, augmentation, sampler, dynamic gate의 seed는 모든
+방법에서 `2026`으로 고정됩니다.
+
+```bash
+# LN / LoRA / LN+LoRA
+uv run python train_2sfs.py --dataset dtd --shots 16 --split_seed 1 --setting base2new --peft ln
+uv run python train_2sfs.py --dataset dtd --shots 16 --split_seed 1 --setting base2new --peft lora
+uv run python train_2sfs.py --dataset dtd --shots 16 --split_seed 1 --setting base2new --peft ln_lora
+
+# LoRA-Pro / dynamic gate
+uv run python train_2sfs.py --dataset dtd --shots 16 --split_seed 1 \
+  --setting base2new --peft lora --stage1_optimizer lora_pro
+uv run python train_2sfs.py --dataset dtd --shots 16 --split_seed 1 \
+  --setting base2new --peft ln --gradient_gate abs_identity
+```
+
+공식 few-shot validation은 로딩만 하고 학습·모델 선택에는 사용하지 않습니다.
+`--setting base2new`의 최종 JSON에는 test base accuracy, novel accuracy,
+harmonic mean이 함께 저장됩니다. 기본 출력 위치는 `results/2sfs/`입니다.
+`--ema_early_stop`은 stage 1의 loss EMA로 중단 시점을 정하며 남은 step은
+stage 2에서 사용합니다. 실제 stage별 step 수는 JSON의 `metrics.training`에
+기록됩니다.
+
+아래 split 설명은 `train.py`의 일반 vision loader에만 적용됩니다.
 
 공식 validation split이 있는 DTD, FGVCAircraft, Flowers102는 이를 그대로
 사용합니다. 공식 test split만 있는 데이터셋은 train의 10%를 validation으로

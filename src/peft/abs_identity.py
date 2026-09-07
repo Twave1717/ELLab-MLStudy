@@ -14,12 +14,14 @@ class AbsIdentityGate:
         online_images=4,
         beta=0.95,
         epsilon=1e-30,
+        seed=2026,
     ):
         self.parameters = list(parameters)
         self.init_images = init_images
         self.online_images = online_images
         self.beta = beta
         self.epsilon = epsilon
+        self.seed = seed
         self.first_moment = None
         self.second_square = None
 
@@ -40,7 +42,11 @@ class AbsIdentityGate:
         python_state = random.getstate()
         torch_state = torch.random.get_rng_state()
         cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-        generator = torch.Generator().manual_seed(9137)
+        random.seed(self.seed)
+        torch.manual_seed(self.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.seed)
+        generator = torch.Generator().manual_seed(self.seed)
         count = min(self.init_images, len(dataset))
         indices = torch.randperm(len(dataset), generator=generator)[:count].tolist()
         first_sum = second_sum = None

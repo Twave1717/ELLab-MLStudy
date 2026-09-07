@@ -1,12 +1,18 @@
 import argparse
-from random import Random
+import hashlib
+import json
+import random
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 
-from datasets import get_dataloader
+from datasets.official_2sfs import (
+    OFFICIAL_2SFS_DATASETS,
+    OFFICIAL_SPLIT_SEEDS,
+    build_official_2sfs_loaders,
+)
 from datasets.vision.utils import GLOBAL_SEED
 from src.architecture import CLIP_MODEL, load_clip
 from src.methods import TwoStageCLIP
@@ -21,8 +27,7 @@ from src.peft import (
 
 def train_stage(
     logits_fn, parameters, loader, steps, lr, device, name, writer,
-    on_epoch_end=None, gradient_gate=None, optimizer=None, eta_min=1e-6,
-    early_stop=False,
+    gradient_gate=None, optimizer=None, eta_min=1e-6, early_stop=False,
 ):
     if optimizer is None:
         optimizer = torch.optim.AdamW(parameters, lr=lr)
@@ -37,7 +42,7 @@ def train_stage(
     loss_bad = 0
 
     while cur_step < steps:
-        for batch_index, (images, labels) in enumerate(loader, 1):
+        for images, labels in loader:
             optimizer.zero_grad()
             images, labels = images.to(device), labels.to(device)
             with torch.amp.autocast(device):
@@ -81,9 +86,6 @@ def train_stage(
 
             if cur_step == steps:
                 break
-        if on_epoch_end and batch_index == len(loader):
-            on_epoch_end(cur_step)
-
     return cur_step
 
 
@@ -99,43 +101,61 @@ def evaluate(method, loader, classifier, device, split):
             total_correct += (logits.argmax(dim=1) == labels).sum().item()
             total_size += batch_size
 
-    loss = total_loss / total_size
-    accuracy = total_correct / total_size
-    print(f"{split.title()} - Accuracy: {accuracy * 100:.1f}%, Avg loss: {loss:.6f}")
-    return accuracy
+    if total_size == 0:
+        raise ValueError(f"Empty evaluation split: {split}")
+    metrics = {
+        "loss": total_loss / total_size,
+        "correct": total_correct,
+        "total": total_size,
+        "accuracy": total_correct / total_size,
+    }
+    print(
+        f"{split.title()} - Accuracy: {metrics['accuracy'] * 100:.1f}%, "
+        f"Avg loss: {metrics['loss']:.6f}"
+    )
+    return metrics
 
 
-def build_breakpoint_loader(method, loader, classifier, device, split):
-    incorrect_by_class = {label: [] for label in range(len(loader.dataset.classes))}
-    total_correct = total_size = 0
-
-    with torch.no_grad():
-        for images, labels in loader:
-            images, labels = images.to(device), labels.to(device)
-            predictions = method.classifier_logits(images, classifier).argmax(dim=1)
-            total_correct += (predictions == labels).sum().item()
-            for index in (predictions != labels).nonzero().flatten().tolist():
-                incorrect_by_class[labels[index].item()].append(total_size + index)
-            total_size += labels.size(0)
-
-    rng = Random(GLOBAL_SEED)
-    indices = []
-    for incorrect_indices in incorrect_by_class.values():
-        indices.extend(rng.sample(incorrect_indices, min(50, len(incorrect_indices))))
-
-    dataset = Subset(loader.dataset, indices)
-    dataset.classes = loader.dataset.classes
-    dataset.template = loader.dataset.template
-    print(f"{split.title()} full - Accuracy: {total_correct / total_size * 100:.1f}%, Breakpoint samples: {len(dataset)}")
-    return DataLoader(dataset, batch_size=loader.batch_size)
+def harmonic_mean(base_accuracy, novel_accuracy):
+    denominator = base_accuracy + novel_accuracy
+    if denominator == 0:
+        return 0.0
+    return 2 * base_accuracy * novel_accuracy / denominator
 
 
-def train_2sfs(args, method, train_loader, validation_loader, test_loader, device, writer):
+def seed_training(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def reset_train_stream(loader, seed):
+    if loader.generator is None:
+        raise RuntimeError("The official 2SFS train loader needs a generator")
+    loader.generator.manual_seed(seed)
+    sampler_generator = getattr(loader.sampler, "generator", None)
+    if sampler_generator is None:
+        raise RuntimeError("The official 2SFS train sampler needs a generator")
+    sampler_generator.manual_seed(seed)
+
+
+def config_fingerprint(args):
+    excluded = {"data_root", "results_dir"}
+    config = {
+        key: value for key, value in vars(args).items() if key not in excluded
+    }
+    config["training_seed"] = GLOBAL_SEED
+    payload = json.dumps(config, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:10]
+
+
+def train_2sfs(args, method, train_loader, test_loader, device, writer):
     total_steps = args.shots * args.steps_per_shot
     stage_one_steps = int(total_steps * args.stage_one_ratio)
     method.to(device)
 
-    if args.peft == "lora":
+    if args.peft in ("lora", "ln_lora"):
         lora.apply_lora_to_clip(
             method.model,
             targets=args.lora_targets,
@@ -144,6 +164,10 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
             rank=args.lora_rank,
         )
         lora.mark_only_lora_as_trainable(method.model)
+        if args.peft == "ln_lora":
+            for module in method.model.modules():
+                if isinstance(module, torch.nn.LayerNorm):
+                    module.requires_grad_(True)
     elif args.peft == "ln_half":
         mark_only_half_layernorm_as_trainable(method.model)
     else:
@@ -155,44 +179,11 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
 
     gradient_gate = None
     if args.gradient_gate == "abs_identity":
-        gradient_gate = AbsIdentityGate(parameters)
+        gradient_gate = AbsIdentityGate(parameters, seed=GLOBAL_SEED)
         gradient_gate.initialize(method.stage_one_logits, train_loader.dataset, device)
 
-    on_epoch_end = None
-    if args.setting == "base2new":
-        validation_base_loader, validation_new_loader = validation_loader
-        method.eval()
-        with torch.no_grad():
-            base_classifier = method.encode_text()
-            new_classifier = method.encode_classnames(validation_new_loader.dataset.classes)
-        breakpoint_base_loader = build_breakpoint_loader(method, validation_base_loader, base_classifier, device, "stage1 [0] base")
-        breakpoint_new_loader = build_breakpoint_loader(method, validation_new_loader, new_classifier, device, "stage1 [0] new")
-        previous_step = previous_base_accuracy = previous_new_accuracy = 0
-        writer.add_scalar("Accuracy/stage1_base", 0, 0)
-        writer.add_scalar("Accuracy/stage1_new", 0, 0)
-
-        def track_breakpoint(cur_step):
-            nonlocal previous_step, previous_base_accuracy, previous_new_accuracy
-            method.eval()
-            with torch.no_grad():
-                base_classifier = method.encode_text()
-                new_classifier = method.encode_classnames(breakpoint_new_loader.dataset.classes)
-            base_accuracy = evaluate(method, breakpoint_base_loader, base_classifier, device, f"stage1 [{cur_step}] base")
-            new_accuracy = evaluate(method, breakpoint_new_loader, new_classifier, device, f"stage1 [{cur_step}] new")
-            writer.add_scalar("Accuracy/stage1_base", base_accuracy, cur_step)
-            writer.add_scalar("Accuracy/stage1_new", new_accuracy, cur_step)
-            if cur_step > previous_step:
-                step_gap = cur_step - previous_step
-                base_rate = (base_accuracy - previous_base_accuracy) / step_gap
-                new_rate = (new_accuracy - previous_new_accuracy) / step_gap
-                writer.add_scalar("Rate/stage1_base", base_rate, cur_step)
-                writer.add_scalar("Rate/stage1_new", new_rate, cur_step)
-                writer.add_scalar("Rate/stage1_gap", base_rate - new_rate, cur_step)
-            previous_step, previous_base_accuracy, previous_new_accuracy = cur_step, base_accuracy, new_accuracy
-            method.train()
-
-        on_epoch_end = track_breakpoint
-
+    seed_training(GLOBAL_SEED)
+    reset_train_stream(train_loader, GLOBAL_SEED)
     method.train()
     stage_one_optimizer = None
     stage_one_eta_min = 1e-6
@@ -210,7 +201,6 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         device,
         "stage1",
         writer,
-        on_epoch_end,
         gradient_gate,
         optimizer=stage_one_optimizer,
         eta_min=stage_one_eta_min,
@@ -219,6 +209,8 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
 
     method.initialize_classifier()
     method.eval()
+    seed_training(GLOBAL_SEED)
+    reset_train_stream(train_loader, GLOBAL_SEED)
     stage_two_steps_run = train_stage(
         method.stage_two_logits,
         [method.classifier],
@@ -229,29 +221,64 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         "stage2",
         writer
     )
+    training_metrics = {
+        "stage1_steps": stage_one_steps_run,
+        "stage2_steps": stage_two_steps_run,
+        "total_steps": stage_one_steps_run + stage_two_steps_run,
+    }
 
     method.eval()
     if args.setting == "base2new":
-        validation_base_loader, validation_new_loader = validation_loader
-        evaluate(method, validation_base_loader, method.classifier, device, "validation base")
+        test_base_loader, test_novel_loader = test_loader
+        base_metrics = evaluate(
+            method, test_base_loader, method.classifier, device, "test base"
+        )
         with torch.no_grad():
-            new_classifier = method.encode_classnames(validation_new_loader.dataset.classes)
-        evaluate(method, validation_new_loader, new_classifier, device, "validation new")
-        test_base_loader, test_new_loader = test_loader
-        evaluate(method, test_base_loader, method.classifier, device, "test base")
-        with torch.no_grad():
-            new_classifier = method.encode_classnames(test_new_loader.dataset.classes)
-        evaluate(method, test_new_loader, new_classifier, device, "test new")
+            novel_classifier = method.encode_classnames(
+                test_novel_loader.dataset.classes
+            )
+        novel_metrics = evaluate(
+            method,
+            test_novel_loader,
+            novel_classifier,
+            device,
+            "test novel",
+        )
+        hm = harmonic_mean(
+            base_metrics["accuracy"], novel_metrics["accuracy"]
+        )
+        print(f"Test - Harmonic mean: {hm * 100:.1f}%")
+        writer.add_scalar("Accuracy/test_base", base_metrics["accuracy"], 0)
+        writer.add_scalar("Accuracy/test_novel", novel_metrics["accuracy"], 0)
+        writer.add_scalar("Accuracy/test_harmonic_mean", hm, 0)
+        return {
+            "training": training_metrics,
+            "test": {
+                "base": base_metrics,
+                "novel": novel_metrics,
+                "harmonic_mean": hm,
+            }
+        }
     else:
-        evaluate(method, validation_loader, method.classifier, device, "validation")
-        evaluate(method, test_loader, method.classifier, device, "test")
+        test_metrics = evaluate(
+            method, test_loader, method.classifier, device, "test"
+        )
+        writer.add_scalar("Accuracy/test", test_metrics["accuracy"], 0)
+        return {"training": training_metrics, "test": {"all": test_metrics}}
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="cifar10")
+    parser.add_argument(
+        "--dataset", choices=OFFICIAL_2SFS_DATASETS, default="dtd"
+    )
     parser.add_argument("--shots", type=int, choices=[1, 2, 4, 8, 16], default=1)
-    parser.add_argument("--peft", choices=["ln", "lora", "ln_half"], default="ln")
+    parser.add_argument(
+        "--split_seed", type=int, choices=OFFICIAL_SPLIT_SEEDS, default=1
+    )
+    parser.add_argument(
+        "--peft", choices=["ln", "lora", "ln_lora", "ln_half"], default="ln"
+    )
     parser.add_argument("--gradient_gate", choices=["none", "abs_identity"], default="none")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-4)
@@ -259,6 +286,9 @@ def parse_args():
     parser.add_argument("--stage_one_ratio", type=float, default=0.6)
     parser.add_argument("--setting", choices=["standard", "base2new"], default="standard")
     parser.add_argument("--data_root", default="data")
+    parser.add_argument("--test_batch_size", type=int, default=32)
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--results_dir", default="results/2sfs")
     parser.add_argument("--ema_early_stop", action="store_true")
     parser.add_argument("--lora_targets", nargs="+", choices=lora.TARGETS, default=["q", "k", "v"])
     parser.add_argument("--lora_blocks", choices=["all", "odd", "even"], default="all")
@@ -269,21 +299,28 @@ def parse_args():
     args = parser.parse_args()
     if args.stage1_optimizer == "lora_pro" and args.peft != "lora":
         parser.error("--stage1_optimizer lora_pro requires --peft lora")
+    if args.workers < 0:
+        parser.error("--workers cannot be negative")
     return args
 
 
 def main():
     args = parse_args()
-    torch.manual_seed(GLOBAL_SEED)
+    seed_training(GLOBAL_SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    train_loader, validation_loader, test_loader, _ = get_dataloader(
-        args.batch_size,
-        args.dataset,
-        "2sfs",
+    train_loader, _, test_loader, _ = build_official_2sfs_loaders(
+        batch_size=args.batch_size,
+        dataset_name=args.dataset,
         root=args.data_root,
         shots=args.shots,
-        setting=args.setting
+        setting=args.setting,
+        split_seed=args.split_seed,
+        training_seed=GLOBAL_SEED,
+        test_batch_size=args.test_batch_size,
+        num_workers=args.workers,
     )
     model, tokenizer = load_clip(CLIP_MODEL)
     method = TwoStageCLIP(
@@ -292,12 +329,16 @@ def main():
         train_loader.dataset.classes,
         train_loader.dataset.template
     )
-    run_name = f"{args.dataset}-{args.peft}-{args.shots}shot-ratio{args.stage_one_ratio}"
+    run_name = (
+        f"{args.dataset}-{args.peft}-{args.shots}shot"
+        f"-split{args.split_seed}-seed{GLOBAL_SEED}"
+        f"-ratio{args.stage_one_ratio}"
+    )
     if args.gradient_gate != "none":
         run_name += f"-{args.gradient_gate}"
     if args.setting == "base2new":
         run_name += "-base2new"
-    if args.peft == "lora" and (
+    if args.peft in ("lora", "ln_lora") and (
         args.lora_targets != ["q", "k", "v"]
         or args.lora_blocks != "all"
         or args.lora_modality != "both"
@@ -311,16 +352,37 @@ def main():
         )
         if args.stage1_optimizer == "lora_pro":
             run_name += f"-lr{args.lora_pro_lr:g}"
-    with SummaryWriter(f"runs/2sfs/{run_name}") as writer:
-        train_2sfs(
+    run_name += f"-cfg{config_fingerprint(args)}"
+    run_dir = Path("runs/2sfs") / run_name
+    with SummaryWriter(str(run_dir)) as writer:
+        metrics = train_2sfs(
             args,
             method,
             train_loader,
-            validation_loader,
             test_loader,
             device,
             writer
         )
+    result = {
+        "schema_version": "2sfs-result-v1",
+        "run_name": run_name,
+        "model": CLIP_MODEL,
+        "dataset": args.dataset,
+        "setting": args.setting,
+        "shots": args.shots,
+        "split_seed": args.split_seed,
+        "training_seed": GLOBAL_SEED,
+        "protocol": train_loader.dataset.protocol,
+        "config": vars(args),
+        "metrics": metrics,
+    }
+    results_dir = Path(args.results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    result_path = results_dir / f"{run_name}.json"
+    result_path.write_text(
+        json.dumps(result, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    print(f"Saved results to {result_path}")
 
 
 if __name__ == "__main__":
