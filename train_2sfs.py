@@ -1,35 +1,57 @@
 import argparse
-from random import Random
+import hashlib
+import json
+import math
+import random
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 
-from datasets import get_dataloader
+from datasets.official_2sfs import (
+    OFFICIAL_2SFS_DATASETS,
+    OFFICIAL_SPLIT_SEEDS,
+    build_official_2sfs_loaders,
+)
 from datasets.vision.utils import GLOBAL_SEED
 from src.architecture import CLIP_MODEL, load_clip
 from src.methods import TwoStageCLIP
 from src.peft import (
     AbsIdentityGate,
     LoRAProOptimizer,
+    TwoStageKgCoOp,
     lora,
     mark_only_half_layernorm_as_trainable,
     mark_only_layernorm_as_trainable,
-    TwoStageKgCoOp,
 )
 
+
 def train_stage(
-    method, stage_name, parameters, loader, steps, lr, device, name, writer,
-    on_epoch_end=None, gradient_gate=None, optimizer=None, eta_min=1e-6,
-    early_stop=False,
+    logits_fn, parameters, loader, steps, lr, device, name, writer,
+    gradient_gate=None, optimizer=None, eta_min=1e-6, early_stop=False,
+    loss_fn=None, ln_optimizer=None,
 ):
+    parameters = list(parameters)
     if optimizer is None:
+        if ln_optimizer is not None:
+            raise ValueError("Hybrid training needs an explicit LoRA optimizer")
         optimizer = torch.optim.AdamW(parameters, lr=lr)
+    if ln_optimizer is not None:
+        primary = {id(p) for group in optimizer.param_groups for p in group["params"]}
+        secondary = {id(p) for group in ln_optimizer.param_groups for p in group["params"]}
+        if primary & secondary or primary | secondary != {id(p) for p in parameters}:
+            raise ValueError("Hybrid optimizers must partition the trainable parameters")
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, steps, eta_min=eta_min
     )
-    scaler = torch.amp.GradScaler()
+    ln_scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(ln_optimizer, steps, eta_min=1e-6)
+        if ln_optimizer is not None else None
+    )
+    device_type = torch.device(device).type
+    scaler = torch.amp.GradScaler(device_type if ln_optimizer is not None else "cuda")
+    consecutive_skips = 0
     cur_step = 0
     beta = 0.98
     loss_ema = None
@@ -37,37 +59,63 @@ def train_stage(
     loss_bad = 0
 
     while cur_step < steps:
-        for batch_index, (images, labels) in enumerate(loader, 1):
+        for images, labels in loader:
             optimizer.zero_grad()
-            images, labels = images.to(device), labels.to(device)
-            with torch.amp.autocast(device):
-                if hasattr(method, "compute_loss"):
-                    loss, logits = method.compute_loss(images, labels, stage=stage_name)
-                    losses = loss 
-                else:
-                    logits_fn = method.stage_one_logits if stage_name == "stage1" else method.stage_two_logits
-                    losses = F.cross_entropy(
-                        logits_fn(images), labels,
-                        reduction="none" if gradient_gate else "mean",
-                    )
-                    loss = losses.mean() if gradient_gate else losses
+            if ln_optimizer is not None:
+                ln_optimizer.zero_grad()
+            images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+            with torch.amp.autocast(
+                device_type, enabled=ln_optimizer is None or device_type == "cuda"
+            ):
+                reduction = "none" if gradient_gate else "mean"
+                losses = (
+                    F.cross_entropy(logits_fn(images), labels, reduction=reduction)
+                    if loss_fn is None
+                    else loss_fn(images, labels, reduction=reduction)
+                )
+                loss = losses.mean() if gradient_gate else losses
 
             previous = q = None
-            # KgCoOp 사용 시에는 gradient_gate 스킵
-            if gradient_gate and not hasattr(method, "compute_loss"):
+            if gradient_gate:
                 previous, q = gradient_gate.prepare(losses, cur_step + 1)
 
             scale = scaler.get_scale()
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
+            if ln_optimizer is not None:
+                scaler.unscale_(optimizer)
+                scaler.unscale_(ln_optimizer)
+                if not all(p.grad is None or torch.isfinite(p.grad).all() for p in parameters):
+                    scaler.update()
+                    consecutive_skips += 1
+                    if consecutive_skips >= 100:
+                        raise FloatingPointError("100 consecutive hybrid gradient overflows")
+                    continue
+                # Both optimizers update only after their combined gradients pass.
+                for current_optimizer in (optimizer, ln_optimizer):
+                    current_optimizer.step()
+                    tensors = [p for group in current_optimizer.param_groups for p in group["params"]]
+                    tensors += [
+                        value for state in current_optimizer.state.values()
+                        for value in state.values() if torch.is_tensor(value)
+                    ]
+                    if not all(torch.isfinite(tensor).all() for tensor in tensors):
+                        raise FloatingPointError("Non-finite hybrid optimizer parameter or state")
+            else:
+                scaler.step(optimizer)
             scaler.update()
             if scaler.get_scale() < scale:
+                consecutive_skips += 1
+                if consecutive_skips >= 100:
+                    raise FloatingPointError(f"100 consecutive {name} gradient overflows")
                 continue
-            if gradient_gate and not hasattr(method, "compute_loss"):
+            consecutive_skips = 0
+            if gradient_gate:
                 gradient_gate.apply(previous, q)
                 writer.add_scalar(f"Q/{name}", q.mean().item(), cur_step + 1)
 
             scheduler.step()
+            if ln_scheduler is not None:
+                ln_scheduler.step()
             cur_step += 1
 
             print(f"{name} [{cur_step}/{steps}] Loss: {loss.item():.4f}")
@@ -81,71 +129,152 @@ def train_stage(
                         loss_bad = 0
                     else:
                         loss_bad += 1
-                    loss_ok = loss_bad >= 60  
+                    loss_ok = loss_bad >= 60  # LOSS_PATIENCE
                     if loss_ok:
                         return cur_step
 
             if cur_step == steps:
                 break
-        if on_epoch_end and batch_index == len(loader):
-            on_epoch_end(cur_step)
-
     return cur_step
+
 
 def evaluate(method, loader, classifier, device, split):
     total_loss, total_correct, total_size = 0, 0, 0
 
     with torch.no_grad():
         for images, labels in loader:
-            images, labels = images.to(device), labels.to(device)
+            images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
             logits = method.classifier_logits(images, classifier)
             batch_size = labels.size(0)
             total_loss += F.cross_entropy(logits, labels).item() * batch_size
             total_correct += (logits.argmax(dim=1) == labels).sum().item()
             total_size += batch_size
 
-    loss = total_loss / total_size
-    accuracy = total_correct / total_size
-    print(f"{split.title()} - Accuracy: {accuracy * 100:.1f}%, Avg loss: {loss:.6f}")
-    return accuracy
+    if total_size == 0:
+        raise ValueError(f"Empty evaluation split: {split}")
+    metrics = {
+        "loss": total_loss / total_size,
+        "correct": total_correct,
+        "total": total_size,
+        "accuracy": total_correct / total_size,
+    }
+    print(
+        f"{split.title()} - Accuracy: {metrics['accuracy'] * 100:.1f}%, "
+        f"Avg loss: {metrics['loss']:.6f}"
+    )
+    return metrics
 
-def build_breakpoint_loader(method, loader, classifier, device, split):
-    incorrect_by_class = {label: [] for label in range(len(loader.dataset.classes))}
-    total_correct = total_size = 0
 
-    with torch.no_grad():
-        for images, labels in loader:
-            images, labels = images.to(device), labels.to(device)
-            predictions = method.classifier_logits(images, classifier).argmax(dim=1)
-            total_correct += (predictions == labels).sum().item()
-            for index in (predictions != labels).nonzero().flatten().tolist():
-                incorrect_by_class[labels[index].item()].append(total_size + index)
-            total_size += labels.size(0)
+def harmonic_mean(base_accuracy, novel_accuracy):
+    denominator = base_accuracy + novel_accuracy
+    if denominator == 0:
+        return 0.0
+    return 2 * base_accuracy * novel_accuracy / denominator
 
-    rng = Random(GLOBAL_SEED)
-    indices = []
-    for incorrect_indices in incorrect_by_class.values():
-        indices.extend(rng.sample(incorrect_indices, min(50, len(incorrect_indices))))
 
-    dataset = Subset(loader.dataset, indices)
-    dataset.classes = loader.dataset.classes
-    dataset.template = loader.dataset.template
-    print(f"{split.title()} full - Accuracy: {total_correct / total_size * 100:.1f}%, Breakpoint samples: {len(dataset)}")
-    return DataLoader(dataset, batch_size=loader.batch_size)
+def seed_training(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-def train_2sfs(args, method, train_loader, validation_loader, test_loader, device, writer):
+
+def reset_train_stream(loader, seed):
+    if loader.generator is None:
+        raise RuntimeError("The official 2SFS train loader needs a generator")
+    loader.generator.manual_seed(seed)
+    sampler_generator = getattr(loader.sampler, "generator", None)
+    if sampler_generator is None:
+        raise RuntimeError("The official 2SFS train sampler needs a generator")
+    sampler_generator.manual_seed(seed)
+
+
+def peft_methods(value):
+    if value == "hybrid":
+        return {"ln_half", "lora"}
+    return set(value.replace("ln_lora", "ln+lora").split("+"))
+
+
+def parse_peft(value):
+    if value == "hybrid":
+        return value
+    parts = value.replace("ln_lora", "ln+lora").split("+")
+    supported = ("kgcoop", "ln", "ln_half", "lora")
+    if any(part not in supported for part in parts) or len(set(parts)) != len(parts):
+        raise argparse.ArgumentTypeError("Use distinct PEFT methods: kgcoop, ln, ln_half, lora")
+    if "ln" in parts and "ln_half" in parts:
+        raise argparse.ArgumentTypeError("Choose ln or ln_half, not both")
+    if set(parts) == {"ln", "lora"}:
+        return "ln_lora"
+    return "+".join(part for part in supported if part in parts)
+
+
+def config_fingerprint(args):
+    excluded = {"data_root", "results_dir"}
+    if "kgcoop" not in peft_methods(getattr(args, "peft", "ln")):
+        excluded.update({"n_ctx", "w"})
+    config = {
+        key: value for key, value in vars(args).items() if key not in excluded
+    }
+    config["training_seed"] = GLOBAL_SEED
+    payload = json.dumps(config, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:10]
+
+
+def record_validation(method, loaders, device, writer, stage, step, results):
+    was_training = method.training
+    method.eval()
+    try:
+        # Monitoring must not perturb the training RNG stream.
+        with torch.random.fork_rng(devices=[]), torch.no_grad():
+            base_loader, novel_loader = loaders
+            classifier = method.classifier if method.classifier is not None else method.encode_text()
+            base = evaluate(method, base_loader, classifier, device, f"{stage} validation base")
+            novel = evaluate(
+                method, novel_loader, method.encode_classnames(novel_loader.dataset.classes),
+                device, f"{stage} validation novel",
+            )
+    finally:
+        method.train(was_training)
+    scores = {
+        "base": base["accuracy"], "novel": novel["accuracy"],
+        "hm": harmonic_mean(base["accuracy"], novel["accuracy"]),
+    }
+    results[stage] = {
+        "step": step, **scores,
+        "base_total": base["total"], "novel_total": novel["total"],
+    }
+    for key, value in scores.items():
+        writer.add_scalar(f"Accuracy/validation_{stage}_end_{key}", value, step)
+    path = Path(writer.log_dir) / "metrics.json"
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(results, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    temporary.replace(path)
+    writer.flush()
+
+
+def train_2sfs(args, method, train_loader, test_loader, device, writer, validation_loader=None):
     total_steps = args.shots * args.steps_per_shot
-    stage_one_steps = int(total_steps * args.stage_one_ratio)
+    stage_one_steps = (
+        total_steps if args.ema_early_stop
+        else int(total_steps * args.stage_one_ratio)
+    )
     method.to(device)
+    monitor_validation = args.peft == "hybrid" and args.setting == "base2new"
+    if monitor_validation and (
+        not isinstance(validation_loader, tuple) or len(validation_loader) != 2
+    ):
+        raise ValueError("Hybrid base2new requires full official base/novel validation loaders")
 
-    #다중 peft 적용
-    peft_methods = args.peft.split('+')
-    
+    methods = peft_methods(args.peft)
     method.model.requires_grad_(False)
-    if hasattr(method, 'prompt_learner'):
+    if "kgcoop" in methods:
         method.prompt_learner.requires_grad_(False)
-
-    if 'lora' in peft_methods:
+    if "ln" in methods:
+        mark_only_layernorm_as_trainable(method.model)
+    elif "ln_half" in methods:
+        mark_only_half_layernorm_as_trainable(method.model)
+    if "lora" in methods:
         lora.apply_lora_to_clip(
             method.model,
             targets=args.lora_targets,
@@ -153,81 +282,46 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
             modality=args.lora_modality,
             rank=args.lora_rank,
         )
-        
-    if 'ln' in peft_methods:
-        mark_only_layernorm_as_trainable(method.model)
-    elif 'ln_half' in peft_methods:
-        mark_only_half_layernorm_as_trainable(method.model)
-        
-    if 'lora' in peft_methods:
-        lora.mark_only_lora_as_trainable(method.model)
-        
-    if 'kgcoop' in peft_methods:
-        method.prompt_learner.requires_grad_(True)
+        # Enable adapters without freezing any selected LayerNorm parameters.
+        for module in lora.lora_modules(method.model).values():
+            module.lora_a.requires_grad_(True)
+            module.lora_b.requires_grad_(True)
+    if "kgcoop" in methods:
+        # The learner also references the frozen backbone token embedding.
+        method.prompt_learner.ctx.requires_grad_(True)
 
     parameters = [parameter for parameter in method.parameters() if parameter.requires_grad]
     if not parameters:
         raise RuntimeError(f"No trainable parameters found after applying PEFT mode: {args.peft}")
 
+    loss_fn = method.stage_one_loss if "kgcoop" in methods else None
     gradient_gate = None
     if args.gradient_gate == "abs_identity":
-        gradient_gate = AbsIdentityGate(parameters)
-        gradient_gate.initialize(method.stage_one_logits, train_loader.dataset, device)
+        gradient_gate = AbsIdentityGate(parameters, seed=GLOBAL_SEED)
+        gradient_gate.initialize(
+            method.stage_one_logits, train_loader.dataset, device, loss_fn=loss_fn
+        )
 
-    on_epoch_end = None
-    if args.setting == "base2new":
-        validation_base_loader, validation_new_loader = validation_loader
-        method.eval()
-        with torch.no_grad():
-            if 'kgcoop' in peft_methods:
-                base_classifier = method.encode_learned_text()
-            else:
-                base_classifier = method.encode_text()
-            new_classifier = method.encode_classnames(validation_new_loader.dataset.classes)
-            
-        breakpoint_base_loader = build_breakpoint_loader(method, validation_base_loader, base_classifier, device, "stage1 [0] base")
-        breakpoint_new_loader = build_breakpoint_loader(method, validation_new_loader, new_classifier, device, "stage1 [0] new")
-        previous_step = previous_base_accuracy = previous_new_accuracy = 0
-        writer.add_scalar("Accuracy/stage1_base", 0, 0)
-        writer.add_scalar("Accuracy/stage1_new", 0, 0)
-
-        def track_breakpoint(cur_step):
-            nonlocal previous_step, previous_base_accuracy, previous_new_accuracy
-            method.eval()
-            with torch.no_grad():
-                if 'kgcoop' in peft_methods:
-                    base_classifier = method.encode_learned_text()
-                else:
-                    base_classifier = method.encode_text()
-                new_classifier = method.encode_classnames(breakpoint_new_loader.dataset.classes)
-            base_accuracy = evaluate(method, breakpoint_base_loader, base_classifier, device, f"stage1 [{cur_step}] base")
-            new_accuracy = evaluate(method, breakpoint_new_loader, new_classifier, device, f"stage1 [{cur_step}] new")
-            writer.add_scalar("Accuracy/stage1_base", base_accuracy, cur_step)
-            writer.add_scalar("Accuracy/stage1_new", new_accuracy, cur_step)
-            if cur_step > previous_step:
-                step_gap = cur_step - previous_step
-                base_rate = (base_accuracy - previous_base_accuracy) / step_gap
-                new_rate = (new_accuracy - previous_new_accuracy) / step_gap
-                writer.add_scalar("Rate/stage1_base", base_rate, cur_step)
-                writer.add_scalar("Rate/stage1_new", new_rate, cur_step)
-                writer.add_scalar("Rate/stage1_gap", base_rate - new_rate, cur_step)
-            previous_step, previous_base_accuracy, previous_new_accuracy = cur_step, base_accuracy, new_accuracy
-            method.train()
-
-        on_epoch_end = track_breakpoint
-
+    seed_training(GLOBAL_SEED)
+    reset_train_stream(train_loader, GLOBAL_SEED)
     method.train()
     stage_one_optimizer = None
+    ln_optimizer = None
     stage_one_eta_min = 1e-6
-    if "lora" in peft_methods and args.stage1_optimizer == "lora_pro":
+    if args.peft in ("lora", "hybrid") and args.stage1_optimizer == "lora_pro":
         stage_one_optimizer = LoRAProOptimizer(
             lora.lora_modules(method.model), args.lora_pro_lr
         )
         stage_one_eta_min = args.lora_pro_lr / 100
-        
+        if args.peft == "hybrid":
+            ln_parameters = [
+                parameter for module in method.model.modules()
+                if isinstance(module, torch.nn.LayerNorm)
+                for parameter in module.parameters() if parameter.requires_grad
+            ]
+            ln_optimizer = torch.optim.AdamW(ln_parameters, lr=args.lr)
     stage_one_steps_run = train_stage(
-        method,
-        "stage1",
+        method.stage_one_logits,
         parameters,
         train_loader,
         stage_one_steps,
@@ -235,18 +329,26 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         device,
         "stage1",
         writer,
-        on_epoch_end,
         gradient_gate,
         optimizer=stage_one_optimizer,
         eta_min=stage_one_eta_min,
         early_stop=args.ema_early_stop,
+        loss_fn=loss_fn,
+        ln_optimizer=ln_optimizer,
     )
 
+    validation_metrics = {}
+    if monitor_validation:
+        record_validation(
+            method, validation_loader, device, writer, "stage1",
+            stage_one_steps_run, validation_metrics,
+        )
     method.initialize_classifier()
     method.eval()
+    seed_training(GLOBAL_SEED)
+    reset_train_stream(train_loader, GLOBAL_SEED)
     stage_two_steps_run = train_stage(
-        method,
-        "stage2",
+        method.stage_two_logits,
         [method.classifier],
         train_loader,
         total_steps - stage_one_steps_run,
@@ -255,99 +357,155 @@ def train_2sfs(args, method, train_loader, validation_loader, test_loader, devic
         "stage2",
         writer
     )
+    training_metrics = {
+        "stage_switch": "loss_ema" if args.ema_early_stop else "fixed_ratio",
+        "stage1_steps": stage_one_steps_run,
+        "stage2_steps": stage_two_steps_run,
+        "total_steps": stage_one_steps_run + stage_two_steps_run,
+    }
 
     method.eval()
+    if monitor_validation:
+        record_validation(
+            method, validation_loader, device, writer, "stage2",
+            training_metrics["total_steps"], validation_metrics,
+        )
     if args.setting == "base2new":
-        validation_base_loader, validation_new_loader = validation_loader
-        evaluate(method, validation_base_loader, method.classifier, device, "validation base")
+        test_base_loader, test_novel_loader = test_loader
+        base_metrics = evaluate(
+            method, test_base_loader, method.classifier, device, "test base"
+        )
         with torch.no_grad():
-            new_classifier = method.encode_classnames(validation_new_loader.dataset.classes)
-        evaluate(method, validation_new_loader, new_classifier, device, "validation new")
-        test_base_loader, test_new_loader = test_loader
-        evaluate(method, test_base_loader, method.classifier, device, "test base")
-        with torch.no_grad():
-            new_classifier = method.encode_classnames(test_new_loader.dataset.classes)
-        evaluate(method, test_new_loader, new_classifier, device, "test new")
+            novel_classifier = method.encode_classnames(
+                test_novel_loader.dataset.classes
+            )
+        novel_metrics = evaluate(
+            method,
+            test_novel_loader,
+            novel_classifier,
+            device,
+            "test novel",
+        )
+        hm = harmonic_mean(
+            base_metrics["accuracy"], novel_metrics["accuracy"]
+        )
+        print(f"Test - Harmonic mean: {hm * 100:.1f}%")
+        writer.add_scalar("Accuracy/test_base", base_metrics["accuracy"], 0)
+        writer.add_scalar("Accuracy/test_novel", novel_metrics["accuracy"], 0)
+        writer.add_scalar("Accuracy/test_harmonic_mean", hm, 0)
+        return {
+            "training": training_metrics,
+            **({"validation": validation_metrics} if monitor_validation else {}),
+            "test": {
+                "base": base_metrics,
+                "novel": novel_metrics,
+                "harmonic_mean": hm,
+            }
+        }
     else:
-        evaluate(method, validation_loader, method.classifier, device, "validation")
-        evaluate(method, test_loader, method.classifier, device, "test")
+        test_metrics = evaluate(
+            method, test_loader, method.classifier, device, "test"
+        )
+        writer.add_scalar("Accuracy/test", test_metrics["accuracy"], 0)
+        return {"training": training_metrics, "test": {"all": test_metrics}}
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="cifar10")
+    parser.add_argument(
+        "--dataset", choices=OFFICIAL_2SFS_DATASETS, default="dtd"
+    )
     parser.add_argument("--shots", type=int, choices=[1, 2, 4, 8, 16], default=1)
-    
-    # PEFT 다중 선택 지원을 위해 type=str로 변경
-    parser.add_argument("--peft", type=str, default="ln", help="PEFT methods, separated by '+' (e.g., kgcoop+lora)")
-    
+    parser.add_argument(
+        "--split_seed", type=int, choices=OFFICIAL_SPLIT_SEEDS, default=1
+    )
+    parser.add_argument(
+        "--peft", type=parse_peft, default="ln",
+        help="PEFT methods joined with +, or hybrid (Half-LN + LoRA-Pro)",
+    )
     parser.add_argument("--gradient_gate", choices=["none", "abs_identity"], default="none")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--steps_per_shot", type=int, default=300)
-    parser.add_argument("--stage_one_ratio", type=float, default=0.6)
+    parser.add_argument(
+        "--stage_one_ratio", type=float, default=0.6,
+        help="Stage 1 budget fraction; ignored with --ema_early_stop",
+    )
     parser.add_argument("--setting", choices=["standard", "base2new"], default="standard")
     parser.add_argument("--data_root", default="data")
+    parser.add_argument("--test_batch_size", type=int, default=32)
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--results_dir", default="results/2sfs")
     parser.add_argument("--ema_early_stop", action="store_true")
-    
-    # LoRA 인자들
     parser.add_argument("--lora_targets", nargs="+", choices=lora.TARGETS, default=["q", "k", "v"])
     parser.add_argument("--lora_blocks", choices=["all", "odd", "even"], default="all")
     parser.add_argument("--lora_modality", choices=["both", "vision", "text"], default="both")
     parser.add_argument("--lora_rank", type=int, default=lora.RANK)
     parser.add_argument("--stage1_optimizer", choices=["adamw", "lora_pro"], default="adamw")
     parser.add_argument("--lora_pro_lr", type=float, default=2e-6)
-    
-    # KgCoOp 인자들
     parser.add_argument("--n_ctx", type=int, default=8, help="KgCoOp context length")
     parser.add_argument("--w", type=float, default=8.0, help="KgCoOp discrepancy loss weight")
-    
     args = parser.parse_args()
-    
-    if args.stage1_optimizer == "lora_pro" and "lora" not in args.peft:
-        parser.error("--stage1_optimizer lora_pro requires 'lora' in --peft")
-        
+    if args.stage1_optimizer == "lora_pro" and args.peft not in ("lora", "hybrid"):
+        parser.error("--stage1_optimizer lora_pro requires --peft lora or hybrid")
+    if args.peft == "hybrid" and (
+        args.stage1_optimizer != "lora_pro" or args.gradient_gate != "none"
+    ):
+        parser.error("--peft hybrid requires --stage1_optimizer lora_pro and --gradient_gate none")
+    if args.workers < 0:
+        parser.error("--workers cannot be negative")
+    if args.n_ctx <= 0 or not math.isfinite(args.w) or args.w < 0:
+        parser.error("--n_ctx must be positive and --w must be finite and nonnegative")
+    if args.steps_per_shot <= 0 or args.batch_size <= 0 or args.test_batch_size <= 0:
+        parser.error("Step and batch sizes must be positive")
+    if args.ema_early_stop:
+        args.stage_one_ratio = None
+    elif not 0 <= args.stage_one_ratio <= 1:
+        parser.error("--stage_one_ratio must be between 0 and 1")
     return args
+
 
 def main():
     args = parse_args()
-    torch.manual_seed(GLOBAL_SEED)
+    seed_training(GLOBAL_SEED)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    train_loader, validation_loader, test_loader, _ = get_dataloader(
-        args.batch_size,
-        args.dataset,
-        "2sfs",
+    train_loader, validation_loader, test_loader, _ = build_official_2sfs_loaders(
+        batch_size=args.batch_size,
+        dataset_name=args.dataset,
         root=args.data_root,
         shots=args.shots,
-        setting=args.setting
+        setting=args.setting,
+        split_seed=args.split_seed,
+        training_seed=GLOBAL_SEED,
+        test_batch_size=args.test_batch_size,
+        num_workers=args.workers,
+        full_validation=args.peft == "hybrid" and args.setting == "base2new",
     )
     model, tokenizer = load_clip(CLIP_MODEL)
-    
-    peft_methods = args.peft.split('+')
-    
-    if "kgcoop" in peft_methods:
-        method = TwoStageKgCoOp(
-            model,
-            tokenizer,
-            train_loader.dataset.classes,
-            train_loader.dataset.template,
-            n_ctx=args.n_ctx,
-            w=args.w
-        )
-    else:
-        method = TwoStageCLIP(
-            model,
-            tokenizer,
-            train_loader.dataset.classes,
-            train_loader.dataset.template
-        )
-        
-    run_name = f"{args.dataset}-{args.peft}-{args.shots}shot-ratio{args.stage_one_ratio}"
+    methods = peft_methods(args.peft)
+    method_class = TwoStageKgCoOp if "kgcoop" in methods else TwoStageCLIP
+    method_options = {"n_ctx": args.n_ctx, "w": args.w} if "kgcoop" in methods else {}
+    method = method_class(
+        model,
+        tokenizer,
+        train_loader.dataset.classes,
+        train_loader.dataset.template,
+        **method_options,
+    )
+    stage_policy = "loss-ema" if args.ema_early_stop else f"ratio{args.stage_one_ratio}"
+    run_name = (
+        f"{args.dataset}-{args.peft}-{args.shots}shot"
+        f"-split{args.split_seed}-seed{GLOBAL_SEED}"
+        f"-{stage_policy}"
+    )
     if args.gradient_gate != "none":
         run_name += f"-{args.gradient_gate}"
     if args.setting == "base2new":
         run_name += "-base2new"
-    if "lora" in peft_methods and (
+    if "lora" in methods and (
         args.lora_targets != ["q", "k", "v"]
         or args.lora_blocks != "all"
         or args.lora_modality != "both"
@@ -361,17 +519,39 @@ def main():
         )
         if args.stage1_optimizer == "lora_pro":
             run_name += f"-lr{args.lora_pro_lr:g}"
-            
-    with SummaryWriter(f"runs/2sfs/{run_name}") as writer:
-        train_2sfs(
+    run_name += f"-cfg{config_fingerprint(args)}"
+    run_dir = Path("runs/2sfs") / run_name
+    with SummaryWriter(str(run_dir)) as writer:
+        metrics = train_2sfs(
             args,
             method,
             train_loader,
-            validation_loader,
             test_loader,
             device,
-            writer
+            writer,
+            validation_loader=validation_loader,
         )
+    result = {
+        "schema_version": "2sfs-result-v1",
+        "run_name": run_name,
+        "model": CLIP_MODEL,
+        "dataset": args.dataset,
+        "setting": args.setting,
+        "shots": args.shots,
+        "split_seed": args.split_seed,
+        "training_seed": GLOBAL_SEED,
+        "protocol": train_loader.dataset.protocol,
+        "config": vars(args),
+        "metrics": metrics,
+    }
+    results_dir = Path(args.results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    result_path = results_dir / f"{run_name}.json"
+    result_path.write_text(
+        json.dumps(result, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    print(f"Saved results to {result_path}")
+
 
 if __name__ == "__main__":
     main()

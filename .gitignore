@@ -12,3 +12,5 @@ tests
 PLAN.md
 temp/
 results/
+/runs/
+/tree_output.txt

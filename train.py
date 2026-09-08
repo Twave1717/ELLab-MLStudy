@@ -96,15 +96,17 @@ def parse_args():
     # paths
     parser.add_argument('--data_root', default="data")
     parser.add_argument('--save_path', default="checkpoint")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.peft == "kgcoop" and args.method != "clip":
+        parser.error("--peft kgcoop requires --method clip")
+    return args
 
 
 def build_method(args, num_classes, dataset):
     if args.method == "clip":
         model, tokenizer = architecture.load_clip(args.model)
         if args.peft == "kgcoop":
-            # KgCoOp 설정 (일반 훈련이 아닌 2SFS를 추천하지만 범용성 보장)
-            from peft.kgcoop import TwoStageKgCoOp
+            from src.peft.kgcoop import TwoStageKgCoOp
             return TwoStageKgCoOp(model, tokenizer, dataset.classes, dataset.template)
         return methods.CLIP(model, tokenizer, dataset.classes, dataset.template)
 
@@ -130,11 +132,10 @@ def configure_peft(args, method):
         mark_only_lora_as_trainable(method)
         print(f"Applied LoRA to {replaced} Linear layers")
     elif args.peft == "kgcoop":
-        # CLIP 백본 고정
-        for param in method.model.parameters():
-            param.requires_grad_(False)
-        method.prompt_learner.requires_grad_(True)
-        print("Applied KgCoOp (frozen backbone, training prompt_learner)")
+        # The prompt learner shares CLIP's token embedding; only ctx is trainable.
+        method.requires_grad_(False)
+        method.prompt_learner.ctx.requires_grad_(True)
+        print("Applied KgCoOp (frozen backbone, training context vectors)")
 
 
 def build_optimizer(args, method):

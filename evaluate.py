@@ -20,12 +20,12 @@ def evaluate_clip(dataset, device, batch_size, data_root, checkpoint=None, peft=
         root=data_root,
     )
     clip_model, tokenizer = architecture.load_clip(architecture.CLIP_MODEL)
-    
+
     if peft == "kgcoop":
-        from peft.kgcoop import TwoStageKgCoOp
+        from src.peft.kgcoop import TwoStageKgCoOp
         model = TwoStageKgCoOp(clip_model, tokenizer, test_loader.dataset.classes, test_loader.dataset.template)
         if checkpoint:
-            state_dict = torch.load(checkpoint, weights_only=True)
+            state_dict = torch.load(checkpoint, weights_only=True, map_location="cpu")
             model.prompt_learner.load_state_dict(state_dict["prompt_learner"])
     else:
         model = CLIP(
@@ -34,22 +34,22 @@ def evaluate_clip(dataset, device, batch_size, data_root, checkpoint=None, peft=
             test_loader.dataset.classes,
             test_loader.dataset.template,
         )
-        
+
     model.to(device)
     model.eval()
+    if peft == "kgcoop":
+        model.initialize_classifier()
     correct = total = 0
     with torch.no_grad():
         for images, labels in test_loader:
             labels = labels.to(device)
-            
+
             # KgCoOp의 경우 stage_two_logits로 평가
             if peft == "kgcoop":
-                if model.classifier is None:
-                    model.initialize_classifier()
                 logits = model.stage_two_logits(images.to(device))
             else:
                 logits = model(images.to(device))
-                
+
             correct += (logits.argmax(1) == labels).sum().item()
             total += labels.size(0)
     print(f"Zero-shot (or evaluated) accuracy: {correct / total * 100:.1f}%")
