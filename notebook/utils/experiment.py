@@ -18,6 +18,7 @@ from src.methods.twostage import TwoStageCLIP
 from src.peft import (
     apply_lora,
     mark_only_layernorm_as_trainable,
+    mark_only_third_layernorm_as_trainable,
     mark_only_lora_as_trainable,
 )
 
@@ -34,7 +35,7 @@ from .data import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ARTIFACT_DIR = REPO_ROOT / "results/logs/kaggle_breakpoint"
-FIXED_RATIOS = {"ln": 0.6, "lora": 0.3}
+FIXED_RATIOS = {"ln": 0.6, "lora": 0.3, "ln_third": 0.6}
 FINAL_EVALUATION_PROTOCOL = "official_test_only_v1"
 SUBMISSION_PREDICTION_SCHEMA = "id_class_key_v1"
 
@@ -150,6 +151,8 @@ def prepare_method(
         apply_lora(method.model.vision_model)
         apply_lora(method.model.text_model)
         parameters = mark_only_lora_as_trainable(method.model)
+    elif config.peft == "ln_third":
+        parameters = mark_only_third_layernorm_as_trainable(method.model)
     else:
         parameters = mark_only_layernorm_as_trainable(method.model)
     if not parameters:

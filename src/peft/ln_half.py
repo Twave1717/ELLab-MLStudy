@@ -1,7 +1,7 @@
 from torch import nn
 import re
 
-def mark_only_half_layernorm_as_trainable(clip_model):
+def _mark_periodic_layernorm_as_trainable(clip_model, period):
     clip_model.requires_grad_(False)
 
 
@@ -10,8 +10,17 @@ def mark_only_half_layernorm_as_trainable(clip_model):
             if isinstance(module, nn.LayerNorm):                    
                 m = re.search(r"layers\.(\d+)\.", name)
 
-                if m and int(m.group(1)) % 2 == 1:
+                if m and int(m.group(1)) % period == period - 1:
                     module.requires_grad_(True)
                     print(name)
 
     return [parameter for parameter in clip_model.parameters() if parameter.requires_grad]
+
+
+def mark_only_half_layernorm_as_trainable(clip_model):
+    return _mark_periodic_layernorm_as_trainable(clip_model, 2)
+
+
+def mark_only_third_layernorm_as_trainable(clip_model):
+    """Tune LN1/LN2 in blocks 3, 6, 9, ... of both encoders."""
+    return _mark_periodic_layernorm_as_trainable(clip_model, 3)
