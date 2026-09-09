@@ -276,6 +276,15 @@ EMA 계수는 0.98이며 전체 예산의 20% 이후부터 개선 폭 1e-4 미�
 0 step입니다. 실제 단계별 step 수와 전환 방식은 JSON의 `metrics.training`에
 기록됩니다.
 
+`--peft ln_third`는 vision/text encoder의 3·6·9·12번째 블록 LN1/LN2만
+학습합니다(20,480개 파라미터). 기존 LN-half와 optimizer·EMA 설정은 같으며,
+고정 비율 0.6은 비교 기준값입니다. Kaggle 노트북에서도 `peft="ln_third"`를 지원합니다.
+
+```bash
+uv run python train_2sfs.py --dataset dtd --shots 16 --split_seed 1 \
+  --setting base2new --peft ln_third --ema_early_stop --test_batch_size 128 --workers 2
+```
+
 KgCoOp는 `--peft kgcoop`, `kgcoop+ln`, `kgcoop+ln_half`, `kgcoop+lora`,
 `kgcoop+ln+lora`처럼 조합할 수 있습니다. 기존 `ln_lora`는 `ln+lora`의
 별칭으로 유지됩니다. `--n_ctx`(기본 8), `--w`(기본 8.0)로 context 길이와

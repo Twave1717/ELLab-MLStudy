@@ -24,6 +24,7 @@ from src.peft import (
     lora,
     mark_only_half_layernorm_as_trainable,
     mark_only_layernorm_as_trainable,
+    mark_only_third_layernorm_as_trainable,
 )
 
 
@@ -199,11 +200,11 @@ def parse_peft(value):
     if value == "hybrid":
         return value
     parts = value.replace("ln_lora", "ln+lora").split("+")
-    supported = ("kgcoop", "ln", "ln_half", "lora")
+    supported = ("kgcoop", "ln", "ln_half", "ln_third", "lora")
     if any(part not in supported for part in parts) or len(set(parts)) != len(parts):
-        raise argparse.ArgumentTypeError("Use distinct PEFT methods: kgcoop, ln, ln_half, lora")
-    if "ln" in parts and "ln_half" in parts:
-        raise argparse.ArgumentTypeError("Choose ln or ln_half, not both")
+        raise argparse.ArgumentTypeError("Use distinct PEFT methods: kgcoop, ln, ln_half, ln_third, lora")
+    if len(set(parts) & {"ln", "ln_half", "ln_third"}) > 1:
+        raise argparse.ArgumentTypeError("Choose one of ln, ln_half, ln_third")
     if set(parts) == {"ln", "lora"}:
         return "ln_lora"
     return "+".join(part for part in supported if part in parts)
@@ -274,6 +275,8 @@ def train_2sfs(args, method, train_loader, test_loader, device, writer, validati
         mark_only_layernorm_as_trainable(method.model)
     elif "ln_half" in methods:
         mark_only_half_layernorm_as_trainable(method.model)
+    elif "ln_third" in methods:
+        mark_only_third_layernorm_as_trainable(method.model)
     if "lora" in methods:
         lora.apply_lora_to_clip(
             method.model,
