@@ -212,6 +212,7 @@ def parse_peft(value):
 
 def config_fingerprint(args):
     excluded = {"data_root", "results_dir"}
+    excluded.update(key for key in ("base_classes", "base_ratio", "class_seed") if getattr(args, key, None) is None)
     if "kgcoop" not in peft_methods(getattr(args, "peft", "ln")):
         excluded.update({"n_ctx", "w"})
     config = {
@@ -435,6 +436,10 @@ def parse_args():
         help="Stage 1 budget fraction; ignored with --ema_early_stop",
     )
     parser.add_argument("--setting", choices=["standard", "base2new"], default="standard")
+    class_split = parser.add_mutually_exclusive_group()
+    class_split.add_argument("--base_classes", type=int, help="Base class count; base/novel minimum 5")
+    class_split.add_argument("--base_ratio", type=float, help="Base fraction: max(5, ceil(total * ratio))")
+    parser.add_argument("--class_seed", type=int, help="Random base class selection; independent of split_seed")
     parser.add_argument("--data_root", default="data")
     parser.add_argument("--test_batch_size", type=int, default=32)
     parser.add_argument("--workers", type=int, default=8)
@@ -486,6 +491,9 @@ def main():
         test_batch_size=args.test_batch_size,
         num_workers=args.workers,
         full_validation=args.peft == "hybrid" and args.setting == "base2new",
+        base_classes=args.base_classes,
+        base_ratio=args.base_ratio,
+        class_seed=args.class_seed,
     )
     model, tokenizer = load_clip(CLIP_MODEL)
     methods = peft_methods(args.peft)
@@ -508,6 +516,12 @@ def main():
         run_name += f"-{args.gradient_gate}"
     if args.setting == "base2new":
         run_name += "-base2new"
+    if args.base_classes is not None:
+        run_name += f"-base{args.base_classes}"
+    elif args.base_ratio is not None:
+        run_name += f"-base-r{args.base_ratio:g}"
+    if args.class_seed is not None:
+        run_name += f"-class{args.class_seed}"
     if "lora" in methods and (
         args.lora_targets != ["q", "k", "v"]
         or args.lora_blocks != "all"

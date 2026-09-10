@@ -253,6 +253,19 @@ uv run python -m datasets.official_2sfs.prepare --data_root data
 아닙니다. 모델 학습, augmentation, sampler, dynamic gate의 seed는 모든
 방법에서 `2026`으로 고정됩니다.
 
+`--setting base2new`에서 `--base_classes 5` 또는 `--base_ratio 0.1`로 Base 크기를
+지정할 수 있습니다. 비율은 `max(5, ceil(전체 클래스 수 × 비율))`로 계산하며,
+Base/Novel 모두 최소 5개가 필요합니다. 기본은 기존 라벨 순서의 앞 K개가 Base이며,
+`--class_seed 1`을 추가하면 해당 seed로 Base 클래스를 무작위 선택합니다.
+`class_seed`는 공식 few-shot 표본을 선택하는 `split_seed`와 별개이며, 공식 이미지
+split과 few-shot 표본, 학습 seed는 유지됩니다. 크기 옵션 생략 시 50:50을 사용하며,
+지정한 분할과 원래 클래스 라벨은 결과 JSON의 `protocol.class_split`에 기록됩니다.
+
+```bash
+uv run python train_2sfs.py --dataset dtd --shots 16 --setting base2new --base_ratio 0.1
+uv run python train_2sfs.py --dataset dtd --shots 16 --setting base2new --base_ratio 0.1 --class_seed 1 --peft ln_half --ema_early_stop
+```
+
 ```bash
 # LN / LoRA / LN+LoRA
 uv run python train_2sfs.py --dataset dtd --shots 16 --split_seed 1 --setting base2new --peft ln
