@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import random
 from collections import Counter
 from pathlib import Path
@@ -11,7 +12,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 from ..transforms import build_transforms
 
 from .upstream import build_dataset
-from .upstream.utils import Datum
+from .upstream.utils import DatasetBase, Datum
 
 
 UPSTREAM_COMMIT = "64ac143c7d22803bfeeaadfe42f570220ab29b06"
@@ -491,6 +492,40 @@ class SeededRandomSampler(Sampler):
         return len(self.data_source)
 
 
+def _base_class_count(num_classes, setting, base_classes, base_ratio, class_seed=None):
+    if base_classes is None and base_ratio is None and class_seed is None:
+        return None
+    if setting != "base2new" or (base_classes is not None and base_ratio is not None):
+        raise ValueError("Use one class split option with base2new")
+    if base_ratio is not None:
+        if not 0 < base_ratio < 1:
+            raise ValueError("base_ratio must be between 0 and 1")
+        base_classes = max(5, math.ceil(num_classes * base_ratio))
+    elif base_classes is None:
+        base_classes = math.ceil(num_classes / 2)
+    if type(base_classes) is not int or not 5 <= base_classes <= num_classes - 5:
+        raise ValueError(f"Base and novel need at least 5 classes each: base={base_classes}, total={num_classes}")
+    return base_classes
+
+
+def _split_classes(dataset, base_labels, novel_labels):
+    def subset(items, labels):
+        label_map = {label: index for index, label in enumerate(labels)}
+        return [
+            Datum(impath=item.impath, label=label_map[item.label], domain=item.domain, classname=item.classname)
+            for item in items if item.label in label_map
+        ]
+
+    split = DatasetBase(
+        train_x=subset(dataset.train_x, base_labels),
+        val=subset(dataset.val, base_labels),
+        test=subset(dataset.test, base_labels),
+        test_new=subset(dataset.test, novel_labels),
+    )
+    split.template = dataset.template
+    return split
+
+
 def build_official_2sfs_loaders(
     batch_size,
     dataset_name,
@@ -502,8 +537,11 @@ def build_official_2sfs_loaders(
     test_batch_size=None,
     num_workers=8,
     full_validation=False,
+    base_classes=None,
+    base_ratio=None,
+    class_seed=None,
 ):
-    """Load official splits, optionally exposing full base/novel validation for monitoring."""
+    """Load official image splits, with optional base/novel class counts and sampling."""
     if dataset_name not in OFFICIAL_2SFS_DATASETS:
         choices = ", ".join(OFFICIAL_2SFS_DATASETS)
         raise ValueError(
@@ -519,6 +557,8 @@ def build_official_2sfs_loaders(
         raise ValueError("Full official validation requires the base2new setting")
     if num_workers < 0:
         raise ValueError("Official 2SFS num_workers cannot be negative")
+    num_classes = _CLASS_COUNTS[dataset_name]
+    num_base = _base_class_count(num_classes, setting, base_classes, base_ratio, class_seed)
 
     root = Path(root).expanduser().resolve()
     dataset_root, train_manifest, val_manifest = _official_paths(
@@ -557,11 +597,18 @@ def build_official_2sfs_loaders(
             dataset=dataset_name,
             root_path=str(root),
             shots=shots,
-            setting=setting,
+            setting="standard" if num_base is not None else setting,
             seed=split_seed,
         )
     finally:
         random.setstate(python_random_state)
+    base_labels = list(range(num_base or len(dataset.classnames)))
+    if class_seed is not None:
+        base_labels = sorted(random.Random(class_seed).sample(range(num_classes), num_base))
+    novel_labels = [label for label in range(num_classes) if label not in base_labels]
+    if num_base is not None:
+        dataset = _split_classes(dataset, base_labels, novel_labels)
+        print(f"Custom class split: {num_base} base / {len(dataset.test_new_classnames)} novel")
 
     train_transform, test_transform = build_transforms(224, clip=True)
     template = dataset.template[0]
@@ -576,6 +623,22 @@ def build_official_2sfs_loaders(
         source_paths,
         template,
     )
+    if num_base is not None:
+        protocol["name"] = "official-2sfs-custom-classes"
+        protocol["class_split"] = {
+            "policy": "first_k_original_labels",
+            "requested_base_classes": base_classes,
+            "requested_base_ratio": base_ratio,
+            "minimum_classes_per_split": 5,
+            "base_count": num_base,
+            "novel_count": num_classes - num_base,
+            "base_labels": base_labels,
+            "novel_labels": novel_labels,
+            "base_classnames": dataset.classnames,
+            "novel_classnames": dataset.test_new_classnames,
+        }
+        if class_seed is not None:
+            protocol["class_split"].update(policy="random_original_labels", class_seed=class_seed)
     if full_validation:
         protocol.update({
             "validation_scope": "full_official_base_and_novel",
@@ -664,14 +727,15 @@ def build_official_2sfs_loaders(
         # Few-shot manifests stay verified above; monitoring uses the entire source val.
         validation_loaders = []
         class_groups = (
-            (0, dataset.classnames),
-            (len(dataset.classnames), dataset.test_new_classnames),
+            (base_labels, dataset.classnames),
+            (novel_labels, dataset.test_new_classnames),
         )
-        for index, (offset, classnames) in enumerate(class_groups):
+        for index, (labels, classnames) in enumerate(class_groups):
+            label_map = {label: index for index, label in enumerate(labels)}
             items = [
-                Datum(impath=str(path), label=label - offset, classname=classname)
+                Datum(impath=str(path), label=label_map[label], classname=classname)
                 for path, (label, classname) in source_partitions["val"].items()
-                if offset <= label < offset + len(classnames)
+                if label in label_map
             ]
             full_validation_dataset = OfficialDatumDataset(
                 items, root, test_transform, classnames, template, protocol
