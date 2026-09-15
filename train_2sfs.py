@@ -36,13 +36,13 @@ def train_stage(method, parameters, loader, steps, lr, device, name, writer, on_
 
             scheduler.step()
             cur_step += 1
-            print(f"{name} [{cur_step}/{steps}] Loss: {loss.item():.4f}")
+            if cur_step % 300 == 0 or cur_step == steps:
+                print(f"{name} [{cur_step}/{steps}] Loss: {loss.item():.4f}")
             writer.add_scalar(f"Loss/{name}", loss.item(), cur_step)
             if cur_step == steps:
                 break
         if on_epoch_end and batch_index == len(loader):
             on_epoch_end(cur_step)
-
 
 def evaluate(method, loader, classifier, device, split):
     total_loss, total_correct, total_size = 0, 0, 0
