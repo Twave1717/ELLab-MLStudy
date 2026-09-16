@@ -300,8 +300,12 @@ def train_2sfs(args, method, train_loader, test_loader, device, writer, validati
 
     loss_fn = method.stage_one_loss if "kgcoop" in methods else None
     gradient_gate = None
-    if args.gradient_gate == "abs_identity":
-        gradient_gate = AbsIdentityGate(parameters, seed=GLOBAL_SEED)
+    if args.gradient_gate in ("abs_identity", "abs_sqrt"):
+        gradient_gate = AbsIdentityGate(
+            parameters,
+            seed=GLOBAL_SEED,
+            transform="sqrt" if args.gradient_gate == "abs_sqrt" else "identity",
+        )
         gradient_gate.initialize(
             method.stage_one_logits, train_loader.dataset, device, loss_fn=loss_fn
         )
@@ -427,7 +431,9 @@ def parse_args():
         "--peft", type=parse_peft, default="ln",
         help="PEFT methods joined with +, or hybrid (Half-LN + LoRA-Pro)",
     )
-    parser.add_argument("--gradient_gate", choices=["none", "abs_identity"], default="none")
+    parser.add_argument(
+        "--gradient_gate", choices=["none", "abs_identity", "abs_sqrt"], default="none"
+    )
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--steps_per_shot", type=int, default=300)

@@ -15,6 +15,7 @@ class AbsIdentityGate:
         beta=0.95,
         epsilon=1e-30,
         seed=2026,
+        transform="identity",
     ):
         self.parameters = list(parameters)
         self.init_images = init_images
@@ -22,6 +23,9 @@ class AbsIdentityGate:
         self.beta = beta
         self.epsilon = epsilon
         self.seed = seed
+        if transform not in {"identity", "sqrt"}:
+            raise ValueError(f"Unsupported q transform: {transform}")
+        self.transform = transform
         self.first_moment = None
         self.second_square = None
 
@@ -89,6 +93,8 @@ class AbsIdentityGate:
         self.first_moment.lerp_(observed_first, 1.0 - self.beta)
         self.second_square.lerp_(observed_second, 1.0 - self.beta)
         q = self.first_moment.square().div(self.second_square + self.epsilon).clamp_(0.0, 1.0)
+        if self.transform == "sqrt":
+            q.sqrt_()
         previous = [parameter.detach().clone() for parameter in self.parameters]
         return previous, q
 
